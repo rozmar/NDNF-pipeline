@@ -7,7 +7,7 @@ import pandas as pd
 import os
 import numpy as np# use creds to create a client to interact with the Google Drive API
 import json
-
+from pathlib import Path
 
 
 
@@ -66,10 +66,8 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
         return None
 
 def update_metadata(notebook_name,metadata_dir, google_creds_json): 
-    # TODO: This function should also save the current version of the 
-    # spreadsheet with date and time so changes over time are logged
     """
-    Docstring for update_metadata
+    Function to update metadata from a google spreadsheet notebooks.
     
     :param notebook_name: name of the google spreadsheet notebook
     :param metadata_dir: directory to store metadata files
@@ -91,6 +89,11 @@ def update_metadata(notebook_name,metadata_dir, google_creds_json):
             df_wr = fetch_sheet(notebook_name,session,client)
             if type(df_wr) == pd.DataFrame:
                 df_wr.to_csv(os.path.join(metadata_dir,'{}_{}.csv'.format(notebook_name,session))) 
+                archive_path = os.path.join(metadata_dir,'archive','{}_{}'.format(notebook_name,session))
+                archive_fname = '{}.csv'.format(lastmodify['modifiedTime'].replace(':','-'))
+                Path(archive_path).mkdir(parents=True, exist_ok=True)
+                df_wr.to_csv(os.path.join(archive_path,archive_fname)) 
+
         with open(os.path.join(metadata_dir,last_modify_file_name), "w") as write_file:
             json.dump(lastmodify, write_file)
         print('metadata updated')
