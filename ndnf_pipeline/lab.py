@@ -55,7 +55,7 @@ class MouseLine(dj.Manual):
 @schema
 class Subject(dj.Manual):
     definition = """
-    subject_id : int
+    subject_id : varchar(64)
     ---
     -> [nullable] Person
     cage_number =null : int
@@ -121,8 +121,9 @@ class Virus(dj.Manual):
     order_date      : date
     addgene_id=null : int
     lot_number      : varchar(256)    
-    remarks         : varchar(256)
+    virus_remarks         : varchar(256)
     """
+
 @schema
 class Solution(dj.Manual):
     definition = """
@@ -130,7 +131,7 @@ class Solution(dj.Manual):
     ---
     -> Person
     prep_date       : date
-    remarks         : varchar(256)
+    solution_remarks         : varchar(256)
     """
     class SolutionComponent(dj.Part):
         definition = """
@@ -151,7 +152,7 @@ class VirusAliquot(dj.Manual):
     -> [nullable] Solution # nullable in case there is no dilution
     dilution        : Decimal (10, 2) # 1 to how much
     prep_date       : date
-    remarks         : varchar(256)
+    virus_aliquot_remarks         : varchar(256)
     """
 
 @schema
@@ -160,7 +161,7 @@ class VirusMixture(dj.Manual):
     virus_mixture_id : varchar(256)
     ---
     prep_date       : date
-    remarks         : varchar(256)
+    virus_mixture_remarks         : varchar(256)
     """
     class VirusMixturePart(dj.Part):
         definition = """
@@ -168,7 +169,6 @@ class VirusMixture(dj.Manual):
         -> VirusAliquot
         ---
         fraction    : Decimal(5,4)  # fraction of total volume
-        note        : varchar(256)
         """
 
 
@@ -278,7 +278,7 @@ class Surgery(dj.Manual):
         -> [nullable] Surgery.BurrHole
         -> Coordinate
         volume          : Decimal(10,3) # in nl
-        remarks         : varchar(256)
+        virus_injection_remarks         : varchar(256)
         """
         class VirusComponent(dj.Part): #TODO is this final?
             definition = """
