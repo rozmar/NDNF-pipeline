@@ -6,6 +6,7 @@ def ingest_metadata(dj):
     ingest_experimenters(dj)
     ingest_rigs(dj)
     ingest_viruses(dj)
+    ingest_mouse_lines(dj)
 
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
@@ -182,3 +183,18 @@ def ingest_viruses(dj):
             lab.VirusMixture.VirusMixturePart().insert1(virusmixturepartnow)
         except dj.errors.DuplicateError:
             print('duplicate virus mixture part for mixture: ',virusmixturepartnow['virus_mixture_id'], ' already exists')
+
+def ingest_mouse_lines(dj):
+    df_mouselines = pd.read_csv(dj.config['path.metadata']+'NDNF animals_Mouse lines.csv')
+    for mouseline in df_mouselines.iterrows():
+        mouseline = mouseline[1]
+        mouselinedata = {
+                'mouse_line': mouseline['Mouse Line ID'],
+                'line_description': mouseline['Mouse Line Description'],
+                'jax_stock_number': mouseline['JAX#'] if not pd.isna(mouseline['JAX#']) else None,
+                }
+        try:
+            lab.MouseLine().insert1(mouselinedata)
+        except dj.errors.DuplicateError:
+            print('duplicate. mouse line :',mouseline['Mouse Line ID'], ' already exists')
+#
