@@ -29,14 +29,6 @@ class Rig(dj.Manual): # TODO this doesn't capture details of the rig
         """
 
 @schema
-class Transgene(dj.Manual):
-    definition = """
-    transgene : varchar(60)  # e.g., 'Cre', 'tdTomato', 'GCaMP6f'
-    ---
-    transgene_description : varchar(1024)
-    """
-
-@schema
 class MouseLine(dj.Manual):
     definition = """
     mouse_line : varchar(60)  # e.g., 'Pvalb-IRES-Cre', 'Ai14', 'NDNF-Cre'
@@ -45,13 +37,6 @@ class MouseLine(dj.Manual):
     jax_stock_number = null : int
     """
     
-    class MouseLineTransgene(dj.Part):
-        """Transgenes present in this mouse line"""
-        definition = """
-        -> master
-        -> Transgene
-        """
-
 @schema
 class Subject(dj.Manual):
     definition = """
