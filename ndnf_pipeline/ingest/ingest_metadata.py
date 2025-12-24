@@ -2,6 +2,9 @@
 import pandas as pd
 #import ndnf_pipeline.lab as lab
 from .. import lab
+from datetime import datetime
+from datetime import timedelta
+import numpy as np
 def ingest_metadata(dj):
     ingest_experimenters(dj)
     ingest_rigs(dj)
@@ -198,3 +201,230 @@ def ingest_mouse_lines(dj):
         except dj.errors.DuplicateError:
             print('duplicate. mouse line :',mouseline['Mouse Line ID'], ' already exists')
 #
+def ingest_surgeries(dj):
+    print('adding surgeries and stuff')
+    df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
+    for item in df_surgery.iterrows():
+        item = item[1]
+        if item['project'].lower() not in ['behavior','marker gene hunt']:
+            continue
+        subjectdata = {
+                'subject_id': item['animal#'],
+                #'cage_number': item['cage#'],
+                'date_of_birth': item['DOB'],
+                'sex': item['sex'],
+                'user_name': item['experimenter'],
+                }
+        lineage_list = []
+        genotypeidx = 1
+        while 'genotype_'+str(genotypeidx) in item.keys():
+            if type(item['genotype_'+str(genotypeidx)]) == str and item['genotype_'+str(genotypeidx)] != '' and item['genotype_'+str(genotypeidx)] != '-':
+                lineage_list.append( {'subject_id':subjectdata['subject_id'],
+                                    'mouse_line':item['genotype_'+str(genotypeidx)], 
+                                    'zygosity':'Unknown'} )
+            genotypeidx += 1
+        try:
+            lab.Subject().insert1(subjectdata)
+        except dj.errors.DuplicateError:
+            print('duplicate. animal :',item['animal#'], ' already exists')
+        for lineage in lineage_list:
+            try:
+                lab.Subject.Lineage().insert1(lineage)
+            except dj.errors.DuplicateError:
+                print('duplicate lineage. animal :',item['animal#'], ' mouse line: ',lineage['mouse_line'], ' already exists')
+        surgeryidx = 1
+        while 'surgery date ('+str(surgeryidx)+')' in item.keys() and item['surgery date ('+str(surgeryidx)+')'] and type(item['surgery date ('+str(surgeryidx)+')']) == str:
+            start_time = datetime.strptime(item['surgery date ('+str(surgeryidx)+')']+' '+item['surgery time ('+str(surgeryidx)+')'],'%Y/%m/%d %H:%M')
+            end_time = start_time + timedelta(minutes = int(item['surgery length (min) ('+str(surgeryidx)+')']))
+            surgerydata = {
+                'surgery_id': surgeryidx,
+                'subject_id':item['animal#'],
+                'user_name': item['experimenter'],
+                'date':start_time.date(),
+                'start_time': start_time,
+                'end_time': end_time,
+                'surgery_description': item['surgery type ('+str(surgeryidx)+')'],
+                'surgery_notes':str(item['surgery comments ('+str(surgeryidx)+')'])
+                }
+            
+            try:
+                lab.Surgery().insert1(surgerydata)
+            except dj.errors.DuplicateError:
+                print('duplicate. surgery for animal ',item['animal#'], ' already exists: ', start_time)
+            #checking craniotomies
+            #%
+
+            cranioidx = 1
+            while 'craniotomy diameter ('+str(cranioidx)+')' in item.keys() and item['craniotomy diameter ('+str(cranioidx)+')'] and (type(item['craniotomy surgery id ('+str(cranioidx)+')']) == int or type(item['craniotomy surgery id ('+str(cranioidx)+')']) == float):
+                if item['craniotomy surgery id ('+str(cranioidx)+')'] == surgeryidx:
+                    craniotomydata = { # this is not right here
+                            'surgery_id': surgeryidx,
+                            'subject_id':item['animal#'],
+                            'procedure_id':cranioidx,
+                            'skull_reference':item['craniotomy reference ('+str(cranioidx)+')'],
+                            'ml_location':item['craniotomy lateral ('+str(cranioidx)+')'],
+                            'ap_location':item['craniotomy anterior ('+str(cranioidx)+')'],
+                            'surgery_procedure_description': 'craniotomy: ' + str(item['craniotomy comments ('+str(cranioidx)+')']),
+                            }
+                    try:
+                        lab.Surgery.Craniotomy().insert1(craniotomydata)
+                    except dj.errors.DuplicateError:
+                        print('duplicate cranio for animal ',item['animal#'], ' already exists: ', cranioidx)
+                cranioidx += 1
+            virusinjidx = 1
+            while 'virus inj surgery id ('+str(virusinjidx)+')' in item.keys() and item['virus inj virus id ('+str(virusinjidx)+')'] and item['virus inj surgery id ('+str(virusinjidx)+')']:
+                if item['virus inj surgery id ('+str(virusinjidx)+')'] == surgeryidx:
+                    injection_num = []
+                    if '[' in str(item['virus inj ML coordinate ('+str(virusinjidx)+')']):
+                        virus_ml_locations = eval(item['virus inj ML coordinate ('+str(virusinjidx)+')'])
+                        injection_num.append(len(virus_ml_locations))
+                    else:
+                        virus_ml_locations = [int(item['virus inj ML coordinate ('+str(virusinjidx)+')'])]
+                    if '[' in str(item['virus inj AP coordinate ('+str(virusinjidx)+')']):
+                        virus_ap_locations = eval(item['virus inj AP coordinate ('+str(virusinjidx)+')'])
+                        injection_num.append(len(virus_ap_locations))
+                    else:
+                        virus_ap_locations = [int(item['virus inj AP coordinate ('+str(virusinjidx)+')'])]
+                    if '[' in str(item['virus inj DV coordinate ('+str(virusinjidx)+')']):
+                        virus_dv_locations = eval(item['virus inj DV coordinate ('+str(virusinjidx)+')'])
+                        injection_num.append(len(virus_dv_locations))
+                    else:
+                        virus_dv_locations = [int(item['virus inj DV coordinate ('+str(virusinjidx)+')'])]
+                    if '[' in str(item['virus inj volume (nl) ('+str(virusinjidx)+')']):
+                        virus_volumes = eval(item['virus inj volume (nl) ('+str(virusinjidx)+')'])
+                        injection_num.append(len(virus_volumes))
+                    else:
+                        virus_volumes = [int(item['virus inj volume (nl) ('+str(virusinjidx)+')'])]
+                    if '[' in item['virus inj virus id ('+str(virusinjidx)+')']:
+                        virus_ids = eval(item['virus inj virus id ('+str(virusinjidx)+')'])
+                        injection_num.append(len(virus_ids))
+                    else:
+                        virus_ids = [item['virus inj virus id ('+str(virusinjidx)+')']]
+                    burrhole = item['virus inj burrhole (T/F) ('+str(virusinjidx)+')']
+                    
+                    if len(np.unique(injection_num)) > 1:
+                        raise ValueError('Mismatch in number of virus injection parameters for animal ', item['animal#'], ' surgery ', surgeryidx, ' injection ', virusinjidx)
+                    else:
+                        injection_num = injection_num[0]
+
+                    if len(virus_ml_locations) != injection_num:
+                        virus_ml_locations = virus_ml_locations * injection_num
+                    if len(virus_ap_locations) != injection_num:
+                        virus_ap_locations = virus_ap_locations * injection_num
+                    if len(virus_dv_locations) != injection_num:
+                        virus_dv_locations = virus_dv_locations * injection_num
+                    if len(virus_volumes) != injection_num:     
+                        virus_volumes = virus_volumes * injection_num
+                    if len(virus_ids) != injection_num:
+                        virus_ids = virus_ids * injection_num   
+
+                    virus_ap_ml_reference = item['virus inj APML reference ('+str(virusinjidx)+')']
+                    virus_dv_reference = item['virus inj DV reference ('+str(virusinjidx)+')']
+                    if virus_dv_reference in ['dura','Dura','DURA','surface of the brain','Surface of the brain']:
+                        virus_dv_reference = 'dura'
+                    virus_ap_direction = item['virus inj AP direction ('+str(virusinjidx)+')']
+                    virus_ml_direction = item['virus inj ML direction ('+str(virusinjidx)+')']
+                    virus_dv_direction = item['virus inj DV direction ('+str(virusinjidx)+')']
+                    
+                    for virus_ml_location,virus_ap_location,virus_dv_location,virus_volume,virus_id in zip(virus_ml_locations,virus_ap_locations,virus_dv_locations,virus_volumes,virus_ids):
+                        injidx = len(lab.Surgery.VirusInjection() & surgerydata) +1
+                        coordinatesystemdata =  {'ap_ml_reference':virus_ap_ml_reference,
+                                            'dv_reference':virus_dv_reference,
+                                            'ap_direction':virus_ap_direction,
+                                            'ml_direction':virus_ml_direction,
+                                            'dv_direction':virus_dv_direction}
+                        coordinatedata = {'ap_location':virus_ap_location,
+                                            'ml_location':virus_ml_location,
+                                            'dv_location':virus_dv_location,
+                        }  
+                        coordinatedata.update(coordinatesystemdata)
+                        try:
+                            lab.CoordinateSystem().insert1(coordinatesystemdata)
+                        except dj.errors.DuplicateError:
+                            print('duplicate coordinate system already exists: ', coordinatesystemdata) 
+                        try:
+                            lab.Coordinate().insert1(coordinatedata)
+                        except dj.errors.DuplicateError:
+                            print('duplicate coordinate already exists: ', coordinatedata)
+                        
+
+                        virusinjdata = {
+                                'surgery_id': surgeryidx,
+                                'subject_id':item['animal#'],
+                                'injection_id':injidx,
+                                #'virus_id':virus_id,
+                                'volume':virus_volume,
+                                'virus_injection_remarks': 'virus injection: ' + str(item['virus inj comments ('+str(virusinjidx)+')']),
+                                }
+                        virusinjdata.update(coordinatedata)
+                        if burrhole in [True,'T','t','True','TRUE',1]:
+                            burrholeid = len(lab.Surgery.BurrHole() & surgerydata)+1
+                            virusinjdata['burrhole_id'] = burrholeid
+                            burrholedata = {
+                                'surgery_id': surgeryidx,
+                                'subject_id':item['animal#'],
+                                'burrhole_id':burrholeid,
+                                'burrhole_description' : '',
+                                'burrhole_notes':'',
+                                }
+                            burrholecoordinatesystemdata = coordinatesystemdata.copy()
+                            burrholecoordinatesystemdata['dv_direction'] = 'DV'
+                            burrholecoordinatesystemdata['dv_reference'] = 'dura'
+
+                            burrholecoordinatedata = coordinatedata.copy()
+                            burrholecoordinatedata['dv_location'] = 0
+                            burrholecoordinatedata['dv_direction'] = 'DV'
+                            burrholecoordinatedata['dv_reference'] = 'dura'
+                            try:
+                                lab.CoordinateSystem().insert1(burrholecoordinatesystemdata)
+                            except dj.errors.DuplicateError:
+                                print('duplicate coordinate system already exists: ', burrholecoordinatesystemdata)
+                            try:
+                                lab.Coordinate().insert1(burrholecoordinatedata)
+                            except dj.errors.DuplicateError:
+                                print('duplicate coordinate already exists: ', burrholecoordinatedata)
+                            burrholedata.update(burrholecoordinatedata)
+
+                            virusinjdata['burrhole_id'] = burrholeid
+                            try:
+                                lab.Surgery.BurrHole().insert1(burrholedata)
+                            except dj.errors.DuplicateError:
+                                print('duplicate burrhole for animal ',item['animal#'], ' already exists: ', burrholeid)
+
+
+                        else:
+                            virusinjdata['craniotomy_id'] = item['virus inj craniotomy id ('+str(virusinjidx)+')']
+                        try:
+                            lab.Surgery.VirusInjection().insert1(virusinjdata)
+                        except dj.errors.DuplicateError:
+                            print('duplicate virus injection for animal ',item['animal#'], ' already exists: ', injidx)
+                        # let's add the virus itself. 
+                        # if a virus mixture was used:
+                        if len(lab.VirusMixture() & {'virus_mixture_id':virus_id})>0:
+                            virusmixturedict = (lab.VirusMixture & {'virus_mixture_id': virus_id}).fetch1()
+                            virusmixtureparts = lab.VirusMixture.VirusMixturePart & {'virus_mixture_id': virus_id}
+                            for part in virusmixtureparts.fetch(as_dict=True):
+                                virusaliquotdict = (lab.VirusAliquot & {'virus_aliquot_id': part['virus_aliquot_id']}).fetch1()
+                                virusdict = (lab.Virus & {'virus_id': virusaliquotdict['virus_id']}).fetch1()
+                                viruscomponentdata = {
+                                    'surgery_id': surgeryidx,
+                                    'subject_id':item['animal#'],
+                                    'injection_id':injidx,
+                                    'virus_id': virusaliquotdict['virus_id'],
+                                    'effective_titer': (virusdict['titer']/virusaliquotdict['dilution']) * part['fraction'] ,
+                                }
+        
+                                try:
+                                    lab.Surgery.VirusComponent().insert1(viruscomponentdata,ignore_extra_fields=True)
+                                except dj.errors.DuplicateError:
+                                    print('duplicate virus injection for animal ',item['animal#'], ' already exists: ', injidx, ' for virus ', virusaliquotdict['virus_id'])
+
+
+
+
+
+                virusinjidx += 1    
+            #%
+            
+            surgeryidx += 1
+                    
