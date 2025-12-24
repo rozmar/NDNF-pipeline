@@ -10,6 +10,7 @@ def ingest_metadata(dj):
     ingest_rigs(dj)
     ingest_viruses(dj)
     ingest_mouse_lines(dj)
+    ingest_surgeries(dj)
 
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
