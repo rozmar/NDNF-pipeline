@@ -265,11 +265,11 @@ class Surgery(dj.Manual):
         volume          : Decimal(10,3) # in nl
         virus_injection_remarks         : varchar(256)
         """
-        class VirusComponent(dj.Part): #TODO is this final?
-            definition = """
-            # Components of virus injection - e.g., multiple viruses mixed
-            -> master
-            -> Virus
-            ---
-            effective_titer    : Decimal(20,1) # GC/ml
-            """
+    class VirusComponent(dj.Part): #TODO is this final?
+        definition = """
+        # Components of virus injection - e.g., multiple viruses mixed
+        -> master.VirusInjection
+        -> Virus
+        ---
+        effective_titer    : Decimal(20,1) # GC/ml
+        """
