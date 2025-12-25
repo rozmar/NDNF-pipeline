@@ -273,3 +273,38 @@ class Surgery(dj.Manual):
         ---
         effective_titer    : Decimal(20,1) # GC/ml
         """
+@schema
+class Device(dj.Lookup):
+    """Devices within the lab.
+
+    Attributes:
+        device ( varchar(32) ): Device short name.
+        modality ( varchar(64) ): Modality for which this device is used.
+        description ( varchar(256) ): Optional. Description of the device.
+    """
+
+    definition = """
+    -> Rig
+    device             : varchar(32)
+    ---
+    modality           : varchar(64)
+    description=''     : varchar(256)
+    """
+
+    class DeviceCalibration(dj.Part):
+        """Calibration information for devices.
+
+        Attributes:
+            device_calibration_id ( int ): Unique identifier for the calibration entry.
+            calibration_date ( date ): Date when the calibration was performed.
+            calibration_details ( varchar(512) ): Details about the calibration procedure.
+        """
+
+        definition = """
+        -> master
+        device_calibration_id : int
+        ---
+        calibration_date      : date
+        calibration_details   : varchar(512)
+        calibration_dict     : longblob
+        """
