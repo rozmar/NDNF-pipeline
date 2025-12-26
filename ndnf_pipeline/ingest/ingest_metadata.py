@@ -12,6 +12,8 @@ def ingest_metadata(dj):
     ingest_mouse_lines(dj)
     ingest_surgeries(dj)
 
+    # TODO: ingest devices and calibrations
+
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
     df_experimenters = pd.read_csv(metadata_path+'NDNF experimenters_People.csv')
@@ -35,12 +37,13 @@ def ingest_rigs(dj):
     for rig in df_rigs.iterrows():
         rig = rig[1]
         dictnow = {'rig':rig['Rig ID'],
-                'rig_update_date':rig['Date'],
-                'building':rig['Building'],
-                'room':rig['Room'],
-                'rig_description':rig['Description']}
+                   'rig_update_date':rig['Date'],
+                   'building':rig['Building'],
+                   'room':rig['Room'],
+                   'rig_description':rig['Description']}
         rigstatedata.append(dictnow)
-        rigdata.append({'rig':rig['Rig ID']})
+        rigdata.append({'rig':rig['Rig ID'],
+                        'institute_id': rig['Institute']})
 
     print('adding rigs')
     for rignow in rigdata:
@@ -210,7 +213,9 @@ def ingest_surgeries(dj):
         if item['project'].lower() not in ['behavior','marker gene hunt']:
             continue
         subjectdata = {
-                'subject_id': item['animal#'],
+                'subject_id': item['Mouse ID'],
+                'institutional_id': item['animal#'],
+                'institute_id': item['Institute'],
                 #'cage_number': item['cage#'],
                 'date_of_birth': item['DOB'],
                 'sex': item['sex'],
