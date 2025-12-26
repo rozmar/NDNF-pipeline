@@ -3,6 +3,21 @@ from ndnf_pipeline.utils.pipeline_tools import get_schema_name
 
 schema = dj.schema(get_schema_name('lab'),locals())
 
+
+@schema
+class Institute(dj.Lookup):
+    definition = """
+    institute_id   : varchar(64)
+    ---
+    institute_name : varchar(256)
+    """
+    contents = [
+        ('KOKI', 'Institute of Experimental Medicine, Budapest, Hungary'),
+        ('SZTE', 'University of Szeged, Hungary'),
+        ('AI', 'Allen Institute, Seattle, USA'),
+    ]
+
+
 @schema
 class Person(dj.Manual):
     definition = """
@@ -16,6 +31,8 @@ class Person(dj.Manual):
 class Rig(dj.Manual): # TODO this doesn't capture details of the rig
     definition = """
     rig             : varchar(24)
+    ---
+    -> Institute
     """
     class RigState(dj.Part):
         definition = """
@@ -42,7 +59,9 @@ class Subject(dj.Manual):
     definition = """
     subject_id : varchar(64)
     ---
+    -> Institute
     -> [nullable] Person
+    institutional_id   : varchar(64)
     cage_number =null : int
     date_of_birth     : date
     sex               : enum('M','F','Unknown')
@@ -253,6 +272,7 @@ class Surgery(dj.Manual):
         burrhole_description  = ''   : varchar(1000) # shape and tools
         burrhole_notes  = '' : varchar(512)
         """
+
     class VirusInjection(dj.Part):
         definition = """
         # Virus injections
@@ -275,36 +295,19 @@ class Surgery(dj.Manual):
         """
 @schema
 class Device(dj.Lookup):
-    """Devices within the lab.
-
-    Attributes:
-        device ( varchar(32) ): Device short name.
-        modality ( varchar(64) ): Modality for which this device is used.
-        description ( varchar(256) ): Optional. Description of the device.
-    """
-
     definition = """
     -> Rig
     device             : varchar(32)
     ---
-    modality           : varchar(64)
     description=''     : varchar(256)
+    device_dict     : longblob
     """
-
     class DeviceCalibration(dj.Part):
-        """Calibration information for devices.
-
-        Attributes:
-            device_calibration_id ( int ): Unique identifier for the calibration entry.
-            calibration_date ( date ): Date when the calibration was performed.
-            calibration_details ( varchar(512) ): Details about the calibration procedure.
-        """
-
         definition = """
         -> master
         device_calibration_id : int
         ---
-        calibration_date      : date
-        calibration_details   : varchar(512)
-        calibration_dict     : longblob
+        calibration_date         : date
+        calibration_details =''  : varchar(512)
+        calibration_dict         : longblob
         """
