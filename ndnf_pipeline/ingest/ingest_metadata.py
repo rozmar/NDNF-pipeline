@@ -208,6 +208,7 @@ def ingest_mouse_lines(dj):
 def ingest_surgeries(dj):
     print('adding surgeries and stuff')
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
+    df_surgery = df_surgery[1:] # skip explanation row
     for item in df_surgery.iterrows():
         item = item[1]
         if item['project'].lower() not in ['behavior','marker gene hunt']:
