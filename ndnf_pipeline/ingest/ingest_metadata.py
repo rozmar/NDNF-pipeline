@@ -8,6 +8,7 @@ import numpy as np
 def ingest_metadata(dj):
     ingest_experimenters(dj)
     ingest_rigs(dj)
+    ingest_devices_and_calibrations(dj)
     ingest_viruses(dj)
     ingest_mouse_lines(dj)
     ingest_surgeries(dj)
@@ -434,4 +435,43 @@ def ingest_surgeries(dj):
             #%
             
             surgeryidx += 1
+
+def ingest_devices_and_calibrations(dj):
+    df_calibrations = pd.read_csv(dj.config['path.metadata']+'NDNF experimenters_Calibration.csv')
+    for index, row in df_calibrations.iterrows():
+        
+        rig = row['Rig ID']
+        device = row['Device name']
+        device_dict = {} # to hold device info
+        device_dictionary = {'rig': rig,
+                            'device': device,
+                            'device_dict': device_dict,
+                            }
+        try:
+            lab.Device().insert1(device_dictionary)
+        except dj.errors.DuplicateError:
+            pass
+        calibration_date = datetime.strptime(row['Calibration date'], '%Y/%m/%d').date()
+        calibration_id = len((lab.Device.DeviceCalibration()&{'rig': rig,'device':device}))+1
+        if device == 'LoadCell':
+            if len((lab.Device.DeviceCalibration()&{'rig': rig,'device':device,'calibration_date':calibration_date})) >0:
+                continue # already ingested
+            calibration_dict = {}
+            for ax in [0,1]:
+                calibration_dict[ax] = {'g':eval(row['Axis {} g'.format(ax)]),
+                                'vals':eval(row['Axis {} vals'.format(ax)]),
+                                'direction':row['Axis {} direction'.format(ax)]}
+            calibration_dict_out = {'rig': rig,
+                                    'device': device,
+                                    'calibration_date': calibration_date,
+                                # 'calibration_details': '',
+                                    'calibration_dict':calibration_dict,
+                                }
+            try:
+                lab.Device.DeviceCalibration().insert1(calibration_dict_out)
+            except dj.errors.DuplicateError:
+                pass
+        else:
+            print('Unknown device type for calibration ingestion: ', device)
+
                     
