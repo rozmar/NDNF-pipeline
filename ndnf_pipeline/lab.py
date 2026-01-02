@@ -305,9 +305,8 @@ class Device(dj.Lookup):
     class DeviceCalibration(dj.Part):
         definition = """
         -> master
-        device_calibration_id : int
-        ---
         calibration_date         : date
+        ---        
         calibration_details =''  : varchar(512)
         calibration_dict         : longblob
         """
