@@ -11,13 +11,12 @@ class Session(dj.Manual):
     ---
     session_date: date
     session_time: time       # session start time, from the start of the first behavior trial, if available, otherwise from the first recording file
-    unique index (subject_id, session_date, session_time)
     -> lab.Person
     -> lab.Rig
     """
 
 @schema
-class Task(dj.Lookup):
+class Task(dj.Lookup):# TODO maybe these should also be in a google spreadsheet instead of lookup table
     definition = """
     # Type of tasks
     task            : varchar(50)                  # task type
@@ -30,7 +29,7 @@ class Task(dj.Lookup):
 
 
 @schema
-class TaskProtocol(dj.Lookup):
+class TaskProtocol(dj.Lookup):# TODO maybe these should also be in a google spreadsheet instead of lookup table
     definition = """
     # SessionType
     -> Task
@@ -70,13 +69,13 @@ class TrialNote(dj.Manual):
     trial_note  : varchar(255) 
     """
 
-
-@schema
-class SessionTask(dj.Manual):
-    definition = """
-    -> Session
-    -> TaskProtocol
-    """
+# sessiontask makes no sense, probably should be dropped
+# @schema
+# class SessionTask(dj.Manual):
+#     definition = """
+#     -> Session
+#     -> TaskProtocol
+#     """
 
 @schema
 class SessionComment(dj.Manual):
@@ -95,18 +94,37 @@ class SessionDetails(dj.Manual):
     """
 
 @schema
+class ForceDirection(dj.Lookup):
+    definition = """
+    force_direction  : varchar(2)
+    ---
+    force_direction_description : varchar(255)
+    """
+    contents = [('AP', 'anterior-posterior'), 
+                ('PA', 'posterior-anterior'),
+                ('LR', 'left-right'),
+                ('RL', 'right-left')]
+
+@schema
 class TaskSettings(dj.Imported):
     definition = """
     -> Session
     task_setting_id : smallint
     ---
     target_force_lut: longblob  # 2D array mapping force to speed (mm/s)
-    target_force_axes: longblob  # 2x1D array of force values corresponding to the LUT
-    reward_port_moving_speed: decimal(6,3)  # (mm/s)
     reward_port_start_pos: decimal(6,3)  # (mm)
     reward_port_end_pos: decimal(6,3)  # (mm)
     reward_size: decimal(6,3)  # (ul)
     """
+    class ForceAxis(dj.Part):
+        definition = """
+        -> master
+        force_axis_idx: tinyint  # 0: x-axis, 1: y-axis
+        ---
+        -> ForceDirection
+        target_force_axes: longblob  # 1D array of force values corresponding to the force_axis_idx of the LUT
+
+        """
 
 @schema
 class Outcome(dj.Lookup):
@@ -132,7 +150,7 @@ class TrialEventType(dj.Lookup):
     definition = """
     trial_event_type  : varchar(20)  
     """
-    contents = zip(('go', 'threshold crossing', 'trial end', 'reward', 'lick'))
+    contents = zip(('go', 'threshold crossing', 'trial end', 'reward', 'lick','lick offset'))
 
 
 @schema
