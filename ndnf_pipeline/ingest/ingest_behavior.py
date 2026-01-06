@@ -1,3 +1,4 @@
+#%
 import harp
 from .. import lab, experiment
 import os
@@ -7,8 +8,9 @@ from datetime import datetime, timedelta
 import json
 from PIL import Image
 from zoneinfo import ZoneInfo
-
+#%%
 def ingest_behavior_sessions(dj):
+    #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
     df_surgery = df_surgery[1:] # skip explanation row
     subject_ids = df_surgery['Mouse ID'].tolist()
@@ -71,7 +73,7 @@ def ingest_behavior_sessions(dj):
                     dj.conn().ping()
             else:
                 session_dict = (experiment.Session()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}  ).fetch1()
-            matching_trials = experiment.SessionTrial()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}  
+            matching_trials = experiment.SessionTrial()&session_dict
             if len(matching_trials)>0:
                 print('trials already ingested for session {}, skipping'.format(session_dict))
                 continue
@@ -178,6 +180,7 @@ def ingest_behavior_sessions(dj):
                     add_task_parts = True
                     
                 else:
+                    add_task_parts = False
                     new_task_settings = False
                     for tsd in task_settings_dict_list:
                         task_settings_dict = {'subject_id':subject_id,
@@ -188,7 +191,17 @@ def ingest_behavior_sessions(dj):
                                             'reward_port_end_pos': start_end_mm[1],
                                             'reward_size': reward_size,
                                             }
-                        if tsd == task_settings_dict:
+                        same_dict = True
+                        for k in tsd.keys():
+                            if k=='target_force_lut':
+                                if not np.array_equal(tsd[k],task_settings_dict[k]):
+                                    same_dict = False
+                                    break
+                            else:
+                                if tsd[k]!=task_settings_dict[k]:
+                                    same_dict = False
+                                    break
+                        if same_dict:
                             new_task_settings = False
                             break
                     if new_task_settings:
@@ -347,7 +360,7 @@ def ingest_behavior_sessions(dj):
 
                     
 
-                trials_so_far = trial_i+1 # for multiple files in a given session
+                trials_so_far += trial_i+1 # for multiple files in a given session
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
