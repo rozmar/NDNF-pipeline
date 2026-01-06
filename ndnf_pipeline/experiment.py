@@ -43,7 +43,7 @@ class TaskProtocol(dj.Lookup):# TODO maybe these should also be in a google spre
 
 
 @schema
-class SessionTrial(dj.Imported):
+class SessionTrial(dj.Manual):
     definition = """
     -> Session
     trial : smallint 		# trial number
@@ -106,7 +106,7 @@ class ForceDirection(dj.Lookup):
                 ('RL', 'right-left')]
 
 @schema
-class TaskSettings(dj.Imported):
+class TaskSettings(dj.Manual):
     definition = """
     -> Session
     task_setting_id : smallint
@@ -135,7 +135,7 @@ class Outcome(dj.Lookup):
 
 
 @schema
-class BehaviorTrial(dj.Imported):
+class BehaviorTrial(dj.Manual):
     definition = """
     -> SessionTrial
     ----
@@ -150,11 +150,11 @@ class TrialEventType(dj.Lookup):
     definition = """
     trial_event_type  : varchar(20)  
     """
-    contents = zip(('go', 'threshold crossing', 'trial end', 'reward', 'lick','lick offset'))
+    contents = zip(('go', 'threshold crossing', 'trial end', 'reward', 'lick'))
 
 
 @schema
-class TrialEvent(dj.Imported):
+class TrialEvent(dj.Manual):
     definition = """
     -> BehaviorTrial 
     -> TrialEventType
@@ -165,11 +165,24 @@ class TrialEvent(dj.Imported):
     """
 
 @schema
-class TrialForceTrace(dj.Imported):
+class TrialForceTrace(dj.Manual):
     definition = """
     -> BehaviorTrial 
-    force_axis_idx: tinyint  # 0: x-axis, 1: y-axis (??)
     ---
     force_trace_time: longblob  # (s) from trial start
-    force_trace_value: longblob  # (g)
+    """
+    class TrialForceAxis(dj.Part):
+        definition = """
+        -> master
+        force_axis_idx: tinyint  # 0: x-axis, 1: y-axis (??)
+        ---
+        force_trace_value: longblob  # (g)
+        """
+@schema
+class TrialRewardPortPosition(dj.Manual):
+    definition = """
+    -> BehaviorTrial 
+    ---
+    reward_port_position_time: longblob  # (s) from trial start
+    reward_port_position_values: longblob  # (mm)
     """
