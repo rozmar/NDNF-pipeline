@@ -292,7 +292,7 @@ def ingest_behavior_sessions(dj):
                         reward_dict = {'subject_id':subject_id,
                                     'session':session_dict['session'],
                                     'trial':trial_i+trials_so_far,
-                                    'trial_event_type':'lick',
+                                    'trial_event_type':'reward',
                                     'trial_event_id':trial_event_id,
                                     'trial_event_time': reward_timestamp - trial_start_time,
                                     'trial_event_duration': valve_open_time,
