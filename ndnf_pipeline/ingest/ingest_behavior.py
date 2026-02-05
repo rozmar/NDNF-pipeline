@@ -32,11 +32,18 @@ def ingest_behavior_sessions(dj):
             for session_folder in session_folders_:
                 if session_folder.startswith(subject_id+'_'):
                     if 'AIND' in rig:
-                        session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
+                        try:
+                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
+                        except:
+                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y-%m-%dT%H%M%SZ')
                         session_datetime = session_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Los_Angeles"))
                     else:
-                        print('what is the timezone of rig {}'.format(rig))
-                        session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
+                        #print('what is the timezone of rig {}'.format(rig))
+                        try:
+                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
+                        except:
+                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y-%m-%dT%H%M%SZ')
+                        session_datetime = session_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Budapest"))
                     session_folder_date = session_datetime.date()
                     session_folder_time = session_datetime.time()
                     session_folder_dates.append(session_folder_date)
@@ -46,7 +53,11 @@ def ingest_behavior_sessions(dj):
             session_folder_times = np.array(session_folder_times)
             session_folders = np.array(session_folders)
             matching_indices = np.where(session_folder_dates == session_date)[0]
-            session_time = np.min(session_folder_times[matching_indices])
+            try:
+                 session_time = np.min(session_folder_times[matching_indices])
+            except:
+                print('no session found for subject {}'.format(subject_id))
+                continue
             matching_sessions = experiment.Session()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}  
             if len(matching_sessions)==0:
                 session_id = len(experiment.Session()&{'subject_id':subject_id})
@@ -64,6 +75,8 @@ def ingest_behavior_sessions(dj):
                 session_comment_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
                                         'session_comment': row['Comment']}
+                if type(session_comment_dict['session_comment']) is not str:
+                    session_comment_dict['session_comment'] = ''
                 
                 with dj.conn().transaction: #inserting the session
                     print('uploading session {}'.format(session_dict))            
@@ -78,8 +91,8 @@ def ingest_behavior_sessions(dj):
                 print('trials already ingested for session {}, skipping'.format(session_dict))
                 continue
             # get load cell calibration
-            calibration_dates = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell'}).fetch('calibration_date')
-            calibration_dates = calibration_dates[(calibration_dates-session_date)<timedelta(0)]
+            calibration_dates_all = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell'}).fetch('calibration_date')
+            calibration_dates = calibration_dates_all[(calibration_dates_all-session_date)<timedelta(0)]
             calibration_date_needed = np.max(calibration_dates)
             calibration_dict = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell','calibration_date':calibration_date_needed}).fetch1('calibration_dict')
             p_to_g = []
@@ -104,27 +117,54 @@ def ingest_behavior_sessions(dj):
             for mi in matching_indices:
                 session_folder = session_folders[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
-                with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
-                    tasklogic_dict = json.load(f)
-                reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount'] # TODO make this calibrated!!!
-                valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount']*0.05 # TODO make this calibrated!!!
+                try:
+                    with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
+                        tasklogic_dict = json.load(f)
+                except:
+                    with open(os.path.join(session_dir,'behavior/Logs/tasklogic_output.json'),'r') as f:
+                        tasklogic_dict = json.load(f)
+
+                #old version of data structure. -  VVVVVVVVVV
+                #reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount'] # TODO make this calibrated!!!
+                #valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount']*0.05 # TODO make this calibrated!!!
+                #old version of data structure. -   AAAAAAAAAAA
+                
+                
+                reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']
+                valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']*0.05 # TODO make this calibrated!!!
+                
                 #loadcell_limit = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_max']# offset and scale is also here!!
-                loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_min'],# TODO is it true that left corresponds to loadcell 0???
-                                            tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_max']],
-                                        1:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_min'],
-                                            tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_max']]}
-                loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['offset']# offset and scale is also here!!
-                loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['scale']# offset and scale is also here!!
+                # # old logic here: VVVVVVVVVVVVVV
+                # loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_min'],# TODO is it true that left corresponds to loadcell 0???
+                #                             tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_max']],
+                #                         1:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_min'],
+                #                             tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_max']]}
+                # loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['offset']# offset and scale is also here!!
+                # loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['scale']# offset and scale is also here!!
+                
+                # # old logic here: AAAAAAAAAAAAA
+                lut_reference_name = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['lut_reference']
+
+                loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_min'],# TODO is it true that left corresponds to loadcell 0???
+                                            tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_max']],
+                                        1:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_min'],
+                                            tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_max']]}
+
+                loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['offset']# offset and scale is also here!!
+                loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['scale']# offset and scale is also here!!
                 loadcell_limits = []
                 loadcell_limits_dict = {}
                 for pi,p in enumerate(p_to_g):
                     loadcell_limits_dict[pi] = np.polyval(p,loadcell_limits_dict_[pi])
                 loadcell_extent = [loadcell_limits_dict[0][0],loadcell_limits_dict[0][1],loadcell_limits_dict[1][0],loadcell_limits_dict[1][1]]
-                cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['upper_force_threshold']
-                force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['force_duration']
-                start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['continuous_feedback']['converter_lut_output']
+                # cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['upper_force_threshold'] # old logic
+                cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
+                # force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['force_duration'] # old logic
+                force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
+                #start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['continuous_feedback']['converter_lut_output'] # old logic
+                start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
                 distance = np.diff(start_end_mm)[0]
-                forcemap_file = os.path.join(session_dir,"behavior/OperationControl/ForceLut.tiff")
+                forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(lut_reference_name))
             
                 forcemap_im =Image.open(forcemap_file)
                 forcemap_im  = np.asarray(forcemap_im,float)+loadcell_offset
