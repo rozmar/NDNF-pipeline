@@ -317,8 +317,8 @@ class SubjectDeath(dj.Manual):
     -> Subject
     ---
     death_date      : date
-    death_cause     : enum('perfusion', 'natural', 'euthanasia', 'accident', 'unknown') 
+    death_cause     : enum('perfusion', 'natural', 'euthanasia', 'accident', 'unknown','other') 
     death_reason    : varchar(255) 
-    perfusion_protocol = null : varchar(64) 
+    perfusion_protocol = null : varchar(512) 
     perfusion_comment = null : varchar(512)
     """

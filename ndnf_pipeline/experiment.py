@@ -1,6 +1,8 @@
 import datajoint as dj
 from ndnf_pipeline.utils.pipeline_tools import get_schema_name
 from ndnf_pipeline import lab
+from ndnf_pipeline import analysis_log
+
 schema = dj.schema(get_schema_name('experiment'),locals())
 
 @schema
@@ -13,6 +15,14 @@ class Session(dj.Manual):
     session_time: time       # session start time, from the start of the first behavior trial, if available, otherwise from the first recording file
     -> lab.Person
     -> lab.Rig
+    """
+
+@schema
+class SessionProvenance(dj.Manual):
+    definition = """
+    -> Session
+    ---
+    -> analysis_log.ExecutionLog
     """
 
 @schema
