@@ -193,10 +193,19 @@ def ingest_behavior_sessions(dj):
                             line = line.replace('true','True')
                             list_now.append(eval(line))
                         data_dict[file[:-5]] = list_now
-                if 'TrialOutcome' not in data_dict.keys():
-                    print('No TrialOutcome found in data_dict keys for session {},skipping'.format(session_dict))
-                    continue
-                hit =np.asarray([a['data']['HarvestAction']['action'] for a in data_dict['TrialOutcome']])=='Left'
+                if data_version == 'v1':
+                    if 'TrialOutcome' not in data_dict.keys():
+                        print('No TrialOutcome found in data_dict keys for session {},skipping'.format(session_dict))
+                        continue
+                elif data_version == 'v2':
+                    if 'RewardOutcome' not in data_dict.keys():
+                        print('No RewardOutcome found in data_dict keys for session {},skipping'.format(session_dict))
+                        continue    
+                if data_version == 'v1':
+                    hit =np.asarray([a['data']['HarvestAction']['action'] for a in data_dict['TrialOutcome']])=='Left'
+                elif data_version == 'v2':
+                    hit =np.asarray([a['data'] for a in data_dict['RewardOutcome']])==True
+
                 lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'))
                 loadcell_data = harp.read(os.path.join(session_dir,"behavior/LoadCells.harp/LoadCells_33.bin"))
                 csvfile = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
@@ -289,13 +298,22 @@ def ingest_behavior_sessions(dj):
                         go_cue_time = data_dict['ResponsePeriod'][trial_i]['timestamp']
                     else:
                         go_cue_time = np.nan
-                    if trial_i == len(data_dict['TrialOutcome'])-1: #use this only for the last trial
-                        trial_end_time = data_dict['TrialOutcome'][trial_i]['timestamp']
-                    else:
-                        trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
+                    if data_version == 'v1':    
+                        if trial_i == len(data_dict['TrialOutcome'])-1: #use this only for the last trial
+                            trial_end_time = data_dict['TrialOutcome'][trial_i]['timestamp']
+                        else:
+                            trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
+                    elif data_version == 'v2':
+                        if trial_i == len(data_dict['RewardOutcome'])-1: #use this only for the last trial
+                            trial_end_time = data_dict['RewardOutcome'][trial_i]['timestamp']
+                        else:
+                            trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
                     
-                    if h:# data_dict['TrialOutcome'][trial_i]['data']['HarvestAction']['action'] == 'Left'
-                        reward_timestamp = data_dict['HarvestActionSelected'][reward_i]['timestamp']
+                    if h:#
+                        if data_version == 'v1':   
+                            reward_timestamp = data_dict['HarvestActionSelected'][reward_i]['timestamp']
+                        elif data_version == 'v2':
+                            reward_timestamp = data_dict['RewardOutcome'][reward_i]['timestamp']
                         reward_i+=1
                         outcome = 'hit'
                     else:
