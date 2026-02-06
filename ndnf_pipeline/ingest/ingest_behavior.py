@@ -289,35 +289,50 @@ def ingest_behavior_sessions(dj):
                                                 }
                         task_setting_dict_part_list.append(task_setting_dict_part)
                 
-                reward_i = 0
-                for trial_i, h in enumerate(hit): # go through trials
-                    if trial_i==0:
+                if data_version == 'v1':
+                    reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
+                elif data_version == 'v2':
+                    reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
+                reward_timestamps = np.array(reward_timestamps)
+
+                go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
+                go_cue_timestamps = np.array(go_cue_timestamps)
+                for trial_i, t_ in enumerate(data_dict['Trial']): # go through trials#hit
+
+                    if trial_i+trials_so_far==0:
                         session_zero_time = data_dict['Trial'][0]['timestamp']
                     trial_start_time = data_dict['Trial'][trial_i]['timestamp']
-                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['has_cue']:
-                        go_cue_time = data_dict['ResponsePeriod'][trial_i]['timestamp']
-                    else:
-                        go_cue_time = np.nan
+                    
                     if data_version == 'v1':    
-                        if trial_i == len(data_dict['TrialOutcome'])-1: #use this only for the last trial
-                            trial_end_time = data_dict['TrialOutcome'][trial_i]['timestamp']
+                        if trial_i == len(data_dict['Trial'])-1: #use this only for the last trial
+                            trial_end_time = data_dict['TrialOutcome'][-1]['timestamp']
                         else:
                             trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
                     elif data_version == 'v2':
-                        if trial_i == len(data_dict['RewardOutcome'])-1: #use this only for the last trial
-                            trial_end_time = data_dict['RewardOutcome'][trial_i]['timestamp']
+                        if trial_i == len(data_dict['Trial'])-1: #use this only for the last trial
+                            trial_end_time = data_dict['RewardOutcome'][-1]['timestamp']
                         else:
                             trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
-                    
+                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['has_cue']:
+                        #go_cue_time = data_dict['ResponsePeriod'][trial_i]['timestamp']
+                        go_cue_timestamps_now = go_cue_timestamps[go_cue_timestamps>trial_start_time]
+                        go_cue_timestamps_now = go_cue_timestamps_now[go_cue_timestamps_now<trial_end_time] 
+                    else:
+                        go_cue_timestamps_now = []
+                    # define if hit happened
+                    reward_timestamps_now = reward_timestamps[reward_timestamps>trial_start_time]
+                    reward_timestamps_now = reward_timestamps_now[reward_timestamps_now<trial_end_time]
+                    if len(reward_timestamps_now)>0:
+                        h = True
+                    else:
+                        h = False
+
+
+
                     if h:#
-                        if data_version == 'v1':   
-                            reward_timestamp = data_dict['HarvestActionSelected'][reward_i]['timestamp']
-                        elif data_version == 'v2':
-                            reward_timestamp = data_dict['RewardOutcome'][reward_i]['timestamp']
-                        reward_i+=1
                         outcome = 'hit'
                     else:
-                        reward_timestamp = np.nan
+
                         outcome = 'miss'
                     sessiontrial_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
@@ -346,29 +361,31 @@ def ingest_behavior_sessions(dj):
                     licks_now = licks_now[licks_now[0].values==1]  # only licks, not no-licks
                     #%
                     trial_event_id = 0
-                    if np.isfinite(go_cue_time):
-                        go_dict = {'subject_id':subject_id,
-                                    'session':session_dict['session'],
-                                    'trial':trial_i+trials_so_far,
-                                    'trial_event_type':'go',
-                                    'trial_event_id':trial_event_id,
-                                    'trial_event_time': go_cue_time - trial_start_time,
-                                    'trial_event_duration': .1,# TODO HARD CODED TIME FOR GO CUE
-                                        }
-                        trial_event_id+=1
-                        trial_event_list.append(go_dict)
+                    if len(go_cue_timestamps_now)>0:
+                        for go_cue_time in go_cue_timestamps_now:
+                            go_dict = {'subject_id':subject_id,
+                                        'session':session_dict['session'],
+                                        'trial':trial_i+trials_so_far,
+                                        'trial_event_type':'go',
+                                        'trial_event_id':trial_event_id,
+                                        'trial_event_time': go_cue_time - trial_start_time,
+                                        'trial_event_duration': .1,# TODO HARD CODED TIME FOR GO CUE
+                                            }
+                            trial_event_id+=1
+                            trial_event_list.append(go_dict)
                         
                     if h:
-                        reward_dict = {'subject_id':subject_id,
-                                    'session':session_dict['session'],
-                                    'trial':trial_i+trials_so_far,
-                                    'trial_event_type':'reward',
-                                    'trial_event_id':trial_event_id,
-                                    'trial_event_time': reward_timestamp - trial_start_time,
-                                    'trial_event_duration': valve_open_time,
-                                        }
-                        trial_event_id+=1
-                        trial_event_list.append(reward_dict)
+                        for reward_timestamp in reward_timestamps_now:
+                            reward_dict = {'subject_id':subject_id,
+                                        'session':session_dict['session'],
+                                        'trial':trial_i+trials_so_far,
+                                        'trial_event_type':'reward',
+                                        'trial_event_id':trial_event_id,
+                                        'trial_event_time': reward_timestamp - trial_start_time,
+                                        'trial_event_duration': valve_open_time,
+                                            }
+                            trial_event_id+=1
+                            trial_event_list.append(reward_dict)
                         
 
                     for lick_time, lick_row in licks_now.iterrows():
