@@ -12,6 +12,8 @@ def ingest_metadata(dj):
     ingest_viruses(dj)
     ingest_mouse_lines(dj)
     ingest_surgeries(dj)
+    ingest_death(dj)
+
 
     # TODO: ingest devices and calibrations
 
@@ -473,5 +475,48 @@ def ingest_devices_and_calibrations(dj):
                 pass
         else:
             print('Unknown device type for calibration ingestion: ', device)
+
+def ingest_death(dj):
+    print('adding subject death info')
+    df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
+    df_surgery = df_surgery[1:] # skip explanation row
+    
+    for item in df_surgery.iterrows():
+        item = item[1]
+        if pd.isna(item['Death date']) or str(item['Death date']).strip() == '' or str(item['Death date']).strip() == '-':
+            continue
+            
+        try:
+            death_date = datetime.strptime(str(item['Death date']), '%Y/%m/%d').date()
+        except (ValueError, TypeError):
+            print(f"Skipping invalid date format for animal {item['animal#']}: {item['Death date']}")
+            continue
+        
+        death_cause_val = 'unknown'
+        if not pd.isna(item['Death cause']):
+             death_cause_val = item['Death cause']
+             # handle possible whitespace
+             death_cause_val = death_cause_val.strip()
+        
+        # Valid enums: 'perfusion', 'natural', 'euthanasia', 'accident', 'unknown', 'other'
+        valid_causes = ['perfusion', 'natural', 'euthanasia', 'accident', 'unknown', 'other']
+        if death_cause_val not in valid_causes:
+            death_cause_val = 'other' # fallback
+
+        death_data = {
+            'subject_id': item['animal#'],
+            'death_date': death_date,
+            'death_cause': death_cause_val,
+            'death_reason': item['Death reason'] if not pd.isna(item['Death reason']) else 'unknown',
+            'perfusion_protocol': item['Perfusion protocol'] if not pd.isna(item['Perfusion protocol']) else None,
+            'perfusion_comment': item['Perfusion comment'] if not pd.isna(item['Perfusion comment']) else None,
+        }
+        try:
+            lab.SubjectDeath().insert1(death_data)
+        except dj.errors.DuplicateError:
+            pass # already inserted
+        except Exception as e:
+            print(f"Error inserting death info for animal {item['animal#']}: {e}")
+
 
                     

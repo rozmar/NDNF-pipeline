@@ -310,3 +310,15 @@ class Device(dj.Lookup):
         calibration_details =''  : varchar(512)
         calibration_dict         : longblob
         """
+
+@schema
+class SubjectDeath(dj.Manual):
+    definition = """
+    -> Subject
+    ---
+    death_date      : date
+    death_cause     : enum('perfusion', 'natural', 'euthanasia', 'accident', 'unknown') 
+    death_reason    : varchar(255) 
+    perfusion_protocol = null : varchar(64) 
+    perfusion_comment = null : varchar(512)
+    """
