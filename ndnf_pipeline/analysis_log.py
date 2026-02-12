@@ -24,6 +24,7 @@ class ExecutionLog(dj.Manual):
     working_directory   : varchar(512)
     python_version      : varchar(64)
     environment_name    : varchar(255)
+    git_remote_url      : varchar(512)
     installed_packages  : longblob      # output of pip freeze
     """
 
@@ -80,12 +81,14 @@ def log_execution(script_name=''):
         git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo_path).strip().decode('utf-8')
         git_status = subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo_path).strip().decode('utf-8')
         git_diff = subprocess.check_output(['git', 'diff'], cwd=repo_path).strip().decode('utf-8')
+        git_remote_url = subprocess.check_output(['git', 'config', '--get', 'remote.origin.url'], cwd=repo_path).strip().decode('utf-8')
         
     except Exception as e:
         print(f"Warning: Could not capture git info: {e}")
         git_hash = 'unknown'
         git_status = str(e)
         git_diff = ''
+        git_remote_url = ''
 
     # Manually assign execution_log_id
     execution_log_id = len(ExecutionLog()) + 1
@@ -102,10 +105,10 @@ def log_execution(script_name=''):
         'working_directory': cwd,
         'python_version': python_version,
         'environment_name': env_name,
+        'git_remote_url': git_remote_url,
         'installed_packages': installed_packages.encode('utf-8') if installed_packages else b''
     }
     
     ExecutionLog.insert1(key)
     
     return execution_log_id
-
