@@ -248,7 +248,7 @@ def ingest_surgeries(dj):
             end_time = start_time + timedelta(minutes = int(item['surgery length (min) ('+str(surgeryidx)+')']))
             surgerydata = {
                 'surgery_id': surgeryidx,
-                'subject_id':item['animal#'],
+                'subject_id':item['Mouse ID'],
                 'user_name': item['experimenter'],
                 'date':start_time.date(),
                 'start_time': start_time,
@@ -260,7 +260,7 @@ def ingest_surgeries(dj):
             try:
                 lab.Surgery().insert1(surgerydata)
             except dj.errors.DuplicateError:
-                print('duplicate. surgery for animal ',item['animal#'], ' already exists: ', start_time)
+                print('duplicate. surgery for animal ',item['Mouse ID'], ' already exists: ', start_time)
             #checking craniotomies
             #%
 
@@ -269,7 +269,7 @@ def ingest_surgeries(dj):
                 if item['craniotomy surgery id ('+str(cranioidx)+')'] == surgeryidx:
                     craniotomydata = { # this is not right here
                             'surgery_id': surgeryidx,
-                            'subject_id':item['animal#'],
+                            'subject_id':item['Mouse ID'],
                             'procedure_id':cranioidx,
                             'skull_reference':item['craniotomy reference ('+str(cranioidx)+')'],
                             'ml_location':item['craniotomy lateral ('+str(cranioidx)+')'],
@@ -279,7 +279,7 @@ def ingest_surgeries(dj):
                     try:
                         lab.Surgery.Craniotomy().insert1(craniotomydata)
                     except dj.errors.DuplicateError:
-                        print('duplicate cranio for animal ',item['animal#'], ' already exists: ', cranioidx)
+                        print('duplicate cranio for animal ',item['Mouse ID'], ' already exists: ', cranioidx)
                 cranioidx += 1
             virusinjidx = 1
             while 'virus inj surgery id ('+str(virusinjidx)+')' in item.keys() and item['virus inj virus id ('+str(virusinjidx)+')'] and item['virus inj surgery id ('+str(virusinjidx)+')']:
@@ -313,7 +313,7 @@ def ingest_surgeries(dj):
                     burrhole = item['virus inj burrhole (T/F) ('+str(virusinjidx)+')']
                     
                     if len(np.unique(injection_num)) > 1:
-                        raise ValueError('Mismatch in number of virus injection parameters for animal ', item['animal#'], ' surgery ', surgeryidx, ' injection ', virusinjidx)
+                        raise ValueError('Mismatch in number of virus injection parameters for animal ', item['Mouse ID'], ' surgery ', surgeryidx, ' injection ', virusinjidx)
                     else:
                         injection_num = injection_num[0]
 
@@ -360,7 +360,7 @@ def ingest_surgeries(dj):
 
                         virusinjdata = {
                                 'surgery_id': surgeryidx,
-                                'subject_id':item['animal#'],
+                                'subject_id':item['Mouse ID'],
                                 'injection_id':injidx,
                                 #'virus_id':virus_id,
                                 'volume':virus_volume,
@@ -372,7 +372,7 @@ def ingest_surgeries(dj):
                             virusinjdata['burrhole_id'] = burrholeid
                             burrholedata = {
                                 'surgery_id': surgeryidx,
-                                'subject_id':item['animal#'],
+                                'subject_id':item['Mouse ID'],
                                 'burrhole_id':burrholeid,
                                 'burrhole_description' : '',
                                 'burrhole_notes':'',
@@ -399,7 +399,7 @@ def ingest_surgeries(dj):
                             try:
                                 lab.Surgery.BurrHole().insert1(burrholedata)
                             except dj.errors.DuplicateError:
-                                print('duplicate burrhole for animal ',item['animal#'], ' already exists: ', burrholeid)
+                                print('duplicate burrhole for animal ',item['Mouse ID'], ' already exists: ', burrholeid)
 
 
                         else:
@@ -407,7 +407,7 @@ def ingest_surgeries(dj):
                         try:
                             lab.Surgery.VirusInjection().insert1(virusinjdata)
                         except dj.errors.DuplicateError:
-                            print('duplicate virus injection for animal ',item['animal#'], ' already exists: ', injidx)
+                            print('duplicate virus injection for animal ',item['Mouse ID'], ' already exists: ', injidx)
                         # let's add the virus itself. 
                         # if a virus mixture was used:
                         if len(lab.VirusMixture() & {'virus_mixture_id':virus_id})>0:
@@ -418,7 +418,7 @@ def ingest_surgeries(dj):
                                 virusdict = (lab.Virus & {'virus_id': virusaliquotdict['virus_id']}).fetch1()
                                 viruscomponentdata = {
                                     'surgery_id': surgeryidx,
-                                    'subject_id':item['animal#'],
+                                    'subject_id':item['Mouse ID'],
                                     'injection_id':injidx,
                                     'virus_id': virusaliquotdict['virus_id'],
                                     'effective_titer': (virusdict['titer']/virusaliquotdict['dilution']) * part['fraction'] ,
@@ -427,7 +427,7 @@ def ingest_surgeries(dj):
                                 try:
                                     lab.Surgery.VirusComponent().insert1(viruscomponentdata,ignore_extra_fields=True)
                                 except dj.errors.DuplicateError:
-                                    print('duplicate virus injection for animal ',item['animal#'], ' already exists: ', injidx, ' for virus ', virusaliquotdict['virus_id'])
+                                    print('duplicate virus injection for animal ',item['Mouse ID'], ' already exists: ', injidx, ' for virus ', virusaliquotdict['virus_id'])
 
 
 
