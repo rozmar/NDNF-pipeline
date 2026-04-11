@@ -34,6 +34,7 @@ def ingest_behavior_sessions(dj):
             session_folder_dates = []
             session_folder_times = []
             session_folders = []
+            session_data_versions = []
             for session_folder in session_folders_:
                 if session_folder.startswith(subject_id+'_'):
                     if 'AIND' in rig:
@@ -50,15 +51,21 @@ def ingest_behavior_sessions(dj):
                         except:
                             session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y-%m-%dT%H%M%SZ')
                         session_datetime = session_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Budapest"))
-                        data_version = 'v2'
+                        if session_datetime<datetime(2026,2,22,tzinfo = ZoneInfo(key='Europe/Budapest')):
+                            data_version = 'v2'
+                        else:
+                            data_version = 'v3'
+                    #print('data version for session {} is {}'.format(session_folder,data_version))
                     session_folder_date = session_datetime.date()
                     session_folder_time = session_datetime.time()
                     session_folder_dates.append(session_folder_date)
                     session_folder_times.append(session_folder_time)
                     session_folders.append(session_folder)
+                    session_data_versions.append(data_version)
             session_folder_dates = np.array(session_folder_dates)
             session_folder_times = np.array(session_folder_times)
             session_folders = np.array(session_folders)
+            session_data_versions = np.array(session_data_versions) 
             matching_indices = np.where(session_folder_dates == session_date)[0]
             try:
                  session_time = np.min(session_folder_times[matching_indices])
@@ -128,6 +135,7 @@ def ingest_behavior_sessions(dj):
             trials_so_far = 0
             for mi in matching_indices:
                 session_folder = session_folders[mi]
+                data_version = session_data_versions[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
                 try:
                     with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
@@ -148,7 +156,7 @@ def ingest_behavior_sessions(dj):
                     loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['offset']# offset and scale is also here!!
                     loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['scale']# offset and scale is also here!!
                     lut_reference_name = 'ForceLut'
-                elif data_version == 'v2':
+                elif data_version in ['v2','v3']:
                     reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']
                     valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']*0.05 # TODO make this calibrated!!!
                 
@@ -171,7 +179,7 @@ def ingest_behavior_sessions(dj):
                     cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['upper_force_threshold'] # old logic
                     force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['force_duration'] # old logic
                     start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['continuous_feedback']['converter_lut_output'] # old logic                
-                elif data_version == 'v2':
+                elif data_version in ['v2','v3']:
                     cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
                     force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
                     start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
@@ -196,15 +204,24 @@ def ingest_behavior_sessions(dj):
                 if data_version == 'v1':
                     if 'TrialOutcome' not in data_dict.keys():
                         print('No TrialOutcome found in data_dict keys for session {},skipping'.format(session_dict))
+                        print(data_dict.keys())
                         continue
                 elif data_version == 'v2':
                     if 'RewardOutcome' not in data_dict.keys():
                         print('No RewardOutcome found in data_dict keys for session {},skipping'.format(session_dict))
+                        print(data_dict.keys())
                         continue    
+                    reward_string = 'RewardOutcome'
+                elif data_version == 'v3':
+                    if 'IsValidRewardOutcome' not in data_dict.keys():
+                        print('No IsValidRewardOutcome found in data_dict keys for session {},skipping'.format(session_dict))
+                        print(data_dict.keys())
+                        continue    
+                    reward_string = 'IsValidRewardOutcome'
                 if data_version == 'v1':
                     hit =np.asarray([a['data']['HarvestAction']['action'] for a in data_dict['TrialOutcome']])=='Left'
                 elif data_version == 'v2':
-                    hit =np.asarray([a['data'] for a in data_dict['RewardOutcome']])==True
+                    hit =np.asarray([a['data'] for a in data_dict[reward_string]])==True
 
                 lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'))
                 loadcell_data = harp.read(os.path.join(session_dir,"behavior/LoadCells.harp/LoadCells_33.bin"))
@@ -291,7 +308,7 @@ def ingest_behavior_sessions(dj):
                 
                 if data_version == 'v1':
                     reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
-                elif data_version == 'v2':
+                elif data_version in ['v2','v3']:
                     reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
                 reward_timestamps = np.array(reward_timestamps)
 
@@ -308,9 +325,9 @@ def ingest_behavior_sessions(dj):
                             trial_end_time = data_dict['TrialOutcome'][-1]['timestamp']
                         else:
                             trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
-                    elif data_version == 'v2':
+                    elif data_version in ['v2','v3']:
                         if trial_i == len(data_dict['Trial'])-1: #use this only for the last trial
-                            trial_end_time = data_dict['RewardOutcome'][-1]['timestamp']
+                            trial_end_time = data_dict[reward_string][-1]['timestamp']
                         else:
                             trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
                     if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['has_cue']:
