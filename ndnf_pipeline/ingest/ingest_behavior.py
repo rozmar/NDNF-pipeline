@@ -10,6 +10,12 @@ from PIL import Image
 from zoneinfo import ZoneInfo
 from ..analysis_log import log_execution
 #%%
+_SESSION_FORMATS = [
+    '%Y%m%dT%H%M%S',
+    '%Y-%m-%dT%H%M%SZ',
+    '%Y-%m-%dT%H%M%S.%fZ',
+]
+
 def ingest_behavior_sessions(dj):
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
@@ -38,18 +44,32 @@ def ingest_behavior_sessions(dj):
             for session_folder in session_folders_:
                 if session_folder.startswith(subject_id+'_'):
                     if 'AIND' in rig:
-                        try:
-                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
-                        except:
-                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y-%m-%dT%H%M%SZ')
+                        session_str = session_folder[len(subject_id)+1:]
+                        for fmt in _SESSION_FORMATS:
+                            try:
+                                session_datetime = datetime.strptime(session_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            raise ValueError(f"Unrecognized session folder format: {session_str!r}")
+
                         session_datetime = session_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("America/Los_Angeles"))
                         data_version = 'v1'
                     else:
                         #print('what is the timezone of rig {}'.format(rig))
-                        try:
-                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y%m%dT%H%M%S')
-                        except:
-                            session_datetime = datetime.strptime(session_folder[len(subject_id)+1:], '%Y-%m-%dT%H%M%SZ')
+
+
+                        session_str = session_folder[len(subject_id)+1:]
+                        for fmt in _SESSION_FORMATS:
+                            try:
+                                session_datetime = datetime.strptime(session_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            raise ValueError(f"Unrecognized session folder format: {session_str!r}")
+
                         session_datetime = session_datetime.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Budapest"))
                         if session_datetime<datetime(2026,2,22,tzinfo = ZoneInfo(key='Europe/Budapest')):
                             data_version = 'v2'
@@ -159,8 +179,11 @@ def ingest_behavior_sessions(dj):
                 elif data_version in ['v2','v3']:
                     reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']
                     valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']*0.05 # TODO make this calibrated!!!
-                
-                    lut_reference_name = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['lut_reference']
+                    try:
+                        lut_reference_name = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['lut_reference']
+                    except KeyError:
+                        lut_reference_name = 'gaussian_2d'
+                        print('No lut_reference found in tasklogic dict for session {}, using default {}'.format(session_dict,lut_reference_name))
 
                     loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_min'],# TODO is it true that left corresponds to loadcell 0???
                                                 tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_max']],
