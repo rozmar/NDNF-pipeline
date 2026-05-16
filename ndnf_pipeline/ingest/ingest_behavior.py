@@ -262,6 +262,8 @@ def ingest_behavior_sessions(dj):
                 loadcell_t = loadcell_data.index.values
                 loadcell_0 = loadcell_data[0].values# - offset_0
                 loadcell_1 = loadcell_data[1].values#  - offset_1
+                loadcell_2 = loadcell_data[2].values#  - offset_1
+                
                 loadcell_si = np.median(np.diff(loadcell_t))
                 
                 # define a few session-wide parameters
@@ -446,6 +448,7 @@ def ingest_behavior_sessions(dj):
                     force_now_t = loadcell_t[force_needed]-trial_start_time
                     force_now_0 = loadcell_0[force_needed]
                     force_now_1 = loadcell_1[force_needed]
+                    force_now_2 = loadcell_2[force_needed]
                     forcetracedict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
                                         'trial':trial_i+trials_so_far,
@@ -466,6 +469,13 @@ def ingest_behavior_sessions(dj):
                                         'force_trace_value': force_now_1,
                                         }
                     forceaxis_dict_list.append(forceaxis_dict_1)
+                    forceaxis_dict_2 = {'subject_id':subject_id,
+                                        'session':session_dict['session'],
+                                        'trial':trial_i+trials_so_far,
+                                        'force_axis_idx': 2,
+                                        'force_trace_value': force_now_2,
+                                        }
+                    forceaxis_dict_list.append(forceaxis_dict_2)
                     
 
 
