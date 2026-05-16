@@ -4,7 +4,7 @@ from .. import lab, experiment
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import json
 from PIL import Image
 from zoneinfo import ZoneInfo
@@ -260,6 +260,9 @@ def ingest_behavior_sessions(dj):
                 #offset_1 = np.median(loadcell_data[1].values)
                 
                 loadcell_t = loadcell_data.index.values
+                if session_date == date(2026, 5, 15):
+                    # This day probably the loadcell synch was not plugged in.. ?
+                    loadcell_t = loadcell_t + 244293.20
                 loadcell_0 = loadcell_data[0].values# - offset_0
                 loadcell_1 = loadcell_data[1].values#  - offset_1
                 loadcell_2 = loadcell_data[2].values#  - offset_1
