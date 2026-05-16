@@ -262,7 +262,10 @@ def ingest_behavior_sessions(dj):
                 loadcell_t = loadcell_data.index.values
                 if session_date == date(2026, 5, 15):
                     # This day probably the loadcell synch was not plugged in.. ?
-                    loadcell_t = loadcell_t + 244293.20
+                    if subject_id == 'mouse_bbenjamin' and session_folder == 'mouse_bbenjamin_2026-05-15T104437.187042Z': # and rig == 'AIND-Rig1': # only apply this shift to the session that is clearly misaligned, not to all sessions of this day, because the other session of this day looks fine
+                        loadcell_t = loadcell_t + 243065.47
+                    else:
+                        loadcell_t = loadcell_t + 244293.20
                 loadcell_0 = loadcell_data[0].values# - offset_0
                 loadcell_1 = loadcell_data[1].values#  - offset_1
                 loadcell_2 = loadcell_data[2].values#  - offset_1
@@ -287,7 +290,7 @@ def ingest_behavior_sessions(dj):
                     
                 else:
                     add_task_parts = False
-                    new_task_settings = False
+                    new_task_settings = True
                     for tsd in task_settings_dict_list:
                         task_settings_dict = {'subject_id':subject_id,
                                             'session':session_dict['session'],
