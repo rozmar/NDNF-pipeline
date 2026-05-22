@@ -135,7 +135,7 @@ def ingest_behavior_sessions(dj):
             calibration_date_needed = np.max(calibration_dates)
             calibration_dict = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell','calibration_date':calibration_date_needed}).fetch1('calibration_dict')
             p_to_g = []
-            for loadcell_i in [0,1]:
+            for loadcell_i in [0,1,2]:
                 x = calibration_dict[loadcell_i]['g']
                 y= calibration_dict[loadcell_i]['vals']
                 p = np.polyfit(x,y,1)
@@ -195,9 +195,13 @@ def ingest_behavior_sessions(dj):
                 loadcell_limits = []
                 loadcell_limits_dict = {}
                 for pi,p in enumerate(p_to_g):
+                    if pi not in loadcell_limits_dict_.keys():
+                        print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
+                        continue
                     loadcell_limits_dict[pi] = np.polyval(p,loadcell_limits_dict_[pi])
-                loadcell_extent = [loadcell_limits_dict[0][0],loadcell_limits_dict[0][1],loadcell_limits_dict[1][0],loadcell_limits_dict[1][1]]
+                #loadcell_extent = [loadcell_limits_dict[0][0],loadcell_limits_dict[0][1],loadcell_limits_dict[1][0],loadcell_limits_dict[1][1]]
                 # 
+                
                 if data_version == 'v1':
                     cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['upper_force_threshold'] # old logic
                     force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['force_duration'] # old logic
@@ -266,6 +270,8 @@ def ingest_behavior_sessions(dj):
                         loadcell_t = loadcell_t + 243065.47
                     else:
                         loadcell_t = loadcell_t + 244293.20
+                elif session_date == date(2026, 5, 20):
+                    loadcell_t = loadcell_t + 584628.84
                 loadcell_0 = loadcell_data[0].values# - offset_0
                 loadcell_1 = loadcell_data[1].values#  - offset_1
                 loadcell_2 = loadcell_data[2].values#  - offset_1
@@ -332,7 +338,7 @@ def ingest_behavior_sessions(dj):
                                                 'session':session_dict['session'],
                                                 'task_setting_id':task_setting_id,
                                                 'force_axis_idx': dim,
-                                                'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]),
+                                                'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
                                                 'force_direction': calibration_dict[dim]['direction'],
                                                 }
                         task_setting_dict_part_list.append(task_setting_dict_part)
@@ -343,8 +349,12 @@ def ingest_behavior_sessions(dj):
                     reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
                 reward_timestamps = np.array(reward_timestamps)
 
+                threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
+                threshold_crossing_timestamps = np.array(threshold_crossing_timestamps)
+
                 go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
                 go_cue_timestamps = np.array(go_cue_timestamps)
+                trial_i = 0
                 for trial_i, t_ in enumerate(data_dict['Trial']): # go through trials#hit
 
                     if trial_i+trials_so_far==0:
@@ -370,6 +380,10 @@ def ingest_behavior_sessions(dj):
                     # define if hit happened
                     reward_timestamps_now = reward_timestamps[reward_timestamps>trial_start_time]
                     reward_timestamps_now = reward_timestamps_now[reward_timestamps_now<trial_end_time]
+
+                    threshold_crossing_timestamps_now = threshold_crossing_timestamps[threshold_crossing_timestamps>trial_start_time]
+                    threshold_crossing_timestamps_now = threshold_crossing_timestamps_now[threshold_crossing_timestamps_now<trial_end_time]
+
                     if len(reward_timestamps_now)>0:
                         h = True
                     else:
@@ -380,7 +394,6 @@ def ingest_behavior_sessions(dj):
                     if h:#
                         outcome = 'hit'
                     else:
-
                         outcome = 'miss'
                     sessiontrial_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
@@ -434,6 +447,18 @@ def ingest_behavior_sessions(dj):
                                             }
                             trial_event_id+=1
                             trial_event_list.append(reward_dict)
+                        
+                    for threshold_crossing_timestamp in threshold_crossing_timestamps_now:
+                        threshold_crossing_dict = {'subject_id':subject_id,
+                                    'session':session_dict['session'],
+                                    'trial':trial_i+trials_so_far,
+                                    'trial_event_type':'threshold crossing',
+                                    'trial_event_id':trial_event_id,
+                                    'trial_event_time': threshold_crossing_timestamp - trial_start_time,
+                                    'trial_event_duration': valve_open_time,
+                                        }
+                        trial_event_id+=1
+                        trial_event_list.append(threshold_crossing_dict)
                         
 
                     for lick_time, lick_row in licks_now.iterrows():
@@ -502,8 +527,8 @@ def ingest_behavior_sessions(dj):
 
 
                     
-
-                trials_so_far += trial_i+1 # for multiple files in a given session
+                if trial_i >0:
+                    trials_so_far += trial_i+1 # for multiple files in a given session
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
