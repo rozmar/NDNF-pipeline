@@ -459,7 +459,9 @@ def ingest_devices_and_calibrations(dj):
             if len((lab.Device.DeviceCalibration()&{'rig': rig,'device':device,'calibration_date':calibration_date})) >0:
                 continue # already ingested
             calibration_dict = {}
-            for ax in [0,1]:
+            for ax in [0,1,2]:
+                if row['Axis {} g'.format(ax)] in ['','-']:
+                    continue
                 calibration_dict[ax] = {'g':eval(row['Axis {} g'.format(ax)]),
                                 'vals':eval(row['Axis {} vals'.format(ax)]),
                                 'direction':row['Axis {} direction'.format(ax)]}
