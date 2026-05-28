@@ -15,7 +15,7 @@ _SESSION_FORMATS = [
     '%Y-%m-%dT%H%M%SZ',
     '%Y-%m-%dT%H%M%S.%fZ',
 ]
-
+new_task_per_bonsai_folder = True
 def ingest_behavior_sessions(dj):
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
@@ -157,6 +157,9 @@ def ingest_behavior_sessions(dj):
                 session_folder = session_folders[mi]
                 data_version = session_data_versions[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
+                if 'behavior' not in os.listdir(session_dir):
+                    print('no behavior folder found for session {}, skipping'.format(session_dict))
+                    continue
                 try:
                     with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
@@ -209,14 +212,17 @@ def ingest_behavior_sessions(dj):
                 elif data_version in ['v2','v3']:
                     cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
                     force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
-                    start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
+                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']== None:
+                        start_end_mm = [0,0]
+                    else:
+                        start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
                 distance = np.diff(start_end_mm)[0]
                 forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(lut_reference_name))
             
                 forcemap_im =Image.open(forcemap_file)
                 forcemap_im  = np.asarray(forcemap_im,float)+loadcell_offset
                 forcemap_im = forcemap_im/cached_threshold
-                forcemap_im  = forcemap_im*distance # TODO make sure this is in mm/s!!!
+                forcemap_im  = forcemap_im#*distance # TODO make sure this is in mm/s!!!
 
                 data_dict = {}
                 for file in os.listdir(os.path.join(session_dir,'behavior/SoftwareEvents/')):
@@ -295,30 +301,35 @@ def ingest_behavior_sessions(dj):
                     add_task_parts = True
                     
                 else:
-                    add_task_parts = False
-                    new_task_settings = True
-                    for tsd in task_settings_dict_list:
-                        task_settings_dict = {'subject_id':subject_id,
-                                            'session':session_dict['session'],
-                                            'task_setting_id': tsd['task_setting_id'],
-                                            'target_force_lut': forcemap_im,
-                                            'reward_port_start_pos': start_end_mm[0],
-                                            'reward_port_end_pos': start_end_mm[1],
-                                            'reward_size': reward_size,
-                                            }
-                        same_dict = True
-                        for k in tsd.keys():
-                            if k=='target_force_lut':
-                                if not np.array_equal(tsd[k],task_settings_dict[k]):
-                                    same_dict = False
-                                    break
-                            else:
-                                if tsd[k]!=task_settings_dict[k]:
-                                    same_dict = False
-                                    break
-                        if same_dict:
-                            new_task_settings = False
-                            break
+                    if new_task_per_bonsai_folder:
+                        new_task_settings = True
+                        add_task_parts = True
+                    else:
+                        add_task_parts = False
+                        new_task_settings = True
+                        for tsd in task_settings_dict_list:
+                            task_settings_dict = {'subject_id':subject_id,
+                                                'session':session_dict['session'],
+                                                'task_setting_id': tsd['task_setting_id'],
+                                                'target_force_lut': forcemap_im,
+                                                'reward_port_start_pos': start_end_mm[0],
+                                                'reward_port_end_pos': start_end_mm[1],
+                                                'reward_size': reward_size,
+                                                }
+                            same_dict = True
+                            for k in tsd.keys():
+                                if k=='target_force_lut':
+                                    if not np.array_equal(tsd[k],task_settings_dict[k]):
+                                        same_dict = False
+                                        break
+                                else:
+                                    if tsd[k]!=task_settings_dict[k]:
+                                        same_dict = False
+                                        break
+                            if same_dict:
+                                new_task_settings = False
+                                break
+                    
                     if new_task_settings:
                         task_setting_id = len(task_settings_dict_list)
                         task_settings_dict={'subject_id':subject_id,
