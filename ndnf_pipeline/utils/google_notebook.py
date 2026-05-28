@@ -65,37 +65,51 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
     else:
         return None
 
-def update_metadata(notebook_name,metadata_dir, google_creds_json): 
+def update_metadata(notebook_name, metadata_dir, google_creds_json):
     """
     Function to update metadata from a google spreadsheet notebooks.
-    
+
     :param notebook_name: name of the google spreadsheet notebook
     :param metadata_dir: directory to store metadata files
     :param google_creds_json: path to the Google credentials JSON file
     """
     creds, client = create_client(google_creds_json)
-    lastmodify = fetch_lastmodify_time(notebook_name,client,creds)
-    last_modify_file_name = notebook_name.replace(' ','_')+'_'+'last_modify_time.json'
-    if last_modify_file_name in os.listdir(metadata_dir):
-        with open(os.path.join(metadata_dir,last_modify_file_name)) as timedata:
-            lastmodify_prev = json.loads(timedata.read())
-        redownload = lastmodify != lastmodify_prev
+
+    # Open spreadsheet once and reuse
+    wb = client.open(notebook_name)
+    service = build('drive', 'v3', credentials=creds)
+    lastmodify = service.files().get(fileId=wb.id, fields='modifiedTime').execute()
+
+    last_modify_file_name = notebook_name.replace(' ', '_') + '_last_modify_time.json'
+    modify_path = os.path.join(metadata_dir, last_modify_file_name)
+    if os.path.exists(modify_path):
+        with open(modify_path) as f:
+            redownload = lastmodify != json.load(f)
     else:
         redownload = True
-    if redownload:
-        print('updating metadata from google drive')
-        sessions = fetch_sheet_titles(notebook_name, client)
-        for session in sessions:
-            df_wr = fetch_sheet(notebook_name,session,client)
-            if type(df_wr) == pd.DataFrame:
-                df_wr.to_csv(os.path.join(metadata_dir,'{}_{}.csv'.format(notebook_name,session))) 
-                archive_path = os.path.join(metadata_dir,'archive','{}_{}'.format(notebook_name,session))
-                archive_fname = '{}.csv'.format(lastmodify['modifiedTime'].replace(':','-'))
-                Path(archive_path).mkdir(parents=True, exist_ok=True)
-                df_wr.to_csv(os.path.join(archive_path,archive_fname)) 
 
-        with open(os.path.join(metadata_dir,last_modify_file_name), "w") as write_file:
-            json.dump(lastmodify, write_file)
-        print('metadata updated')
-    else:
+    if not redownload:
         print('metadata is already up to date')
+        return
+
+    print('updating metadata from google drive')
+
+    # Get all sheet titles in one call, then fetch all data in one batch call
+    sheet_titles = [ws.title for ws in wb.worksheets()]
+    ranges = [f"{title}!A1:OO10000" for title in sheet_titles]
+    batch_result = wb.values_batch_get(ranges, params={'majorDimension': 'ROWS'})
+
+    archive_fname = '{}.csv'.format(lastmodify['modifiedTime'].replace(':', '-'))
+    for title, value_range in zip(sheet_titles, batch_result.get('valueRanges', [])):
+        values = value_range.get('values', [])
+        if not values:
+            continue
+        df = pd.DataFrame(values[1:], columns=values[0])
+        df.to_csv(os.path.join(metadata_dir, f'{notebook_name}_{title}.csv'))
+        archive_path = os.path.join(metadata_dir, 'archive', f'{notebook_name}_{title}')
+        Path(archive_path).mkdir(parents=True, exist_ok=True)
+        df.to_csv(os.path.join(archive_path, archive_fname))
+
+    with open(modify_path, 'w') as f:
+        json.dump(lastmodify, f)
+    print('metadata updated')
