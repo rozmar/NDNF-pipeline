@@ -137,6 +137,18 @@ class TaskSettings(dj.Manual):
         """
 
 @schema
+class Block(dj.Manual):
+    definition = """
+    -> Session
+    block: smallint  # block number within session, ordered chronologically
+    ---
+    -> TaskProtocol
+    -> TaskSettings
+    block_start_time: decimal(10, 5)  # (s) relative to session beginning
+    block_end_time: decimal(10, 5)  # (s) relative to session beginning
+    """
+
+@schema
 class Outcome(dj.Lookup):
     definition = """
     outcome : varchar(32)
@@ -149,8 +161,7 @@ class BehaviorTrial(dj.Manual):
     definition = """
     -> SessionTrial
     ----
-    -> TaskProtocol
-    -> TaskSettings
+    -> Block
     -> Outcome
     """
 

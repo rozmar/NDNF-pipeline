@@ -15,7 +15,6 @@ _SESSION_FORMATS = [
     '%Y-%m-%dT%H%M%SZ',
     '%Y-%m-%dT%H%M%S.%fZ',
 ]
-new_task_per_bonsai_folder = True
 def ingest_behavior_sessions(dj):
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
@@ -145,6 +144,7 @@ def ingest_behavior_sessions(dj):
 
             task_settings_dict_list = []
             task_setting_dict_part_list = []
+            block_dict_list = []
             sessiontrial_dict_list = []
             behaviortrial_dict_list = []
             forcetracedict_list = []
@@ -157,6 +157,8 @@ def ingest_behavior_sessions(dj):
                 session_folder = session_folders[mi]
                 data_version = session_data_versions[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
+                block_first_trial_idx = len(sessiontrial_dict_list)
+                current_block = len(block_dict_list)
                 if 'behavior' not in os.listdir(session_dir):
                     print('no behavior folder found for session {}, skipping'.format(session_dict))
                     continue
@@ -287,61 +289,26 @@ def ingest_behavior_sessions(dj):
                 # define a few session-wide parameters
                 task_protocol = ('DP',0) # ('DP', 0) is the only protocol so far. will extend, could be read from the google spreadsheet
                 
-                if len(task_settings_dict_list)==0:
-                    task_setting_id = 0
-                    task_settings_dict = {'subject_id':subject_id,
-                                        'session':session_dict['session'],
-                                        'task_setting_id': task_setting_id,
-                                        'target_force_lut': forcemap_im,
-                                        'reward_port_start_pos': start_end_mm[0],
-                                        'reward_port_end_pos': start_end_mm[1],
-                                        'reward_size': reward_size,
-                                        }
+                task_settings_dict = None
+                add_task_parts = False
+                for tsd in task_settings_dict_list:
+                    if (np.array_equal(tsd['target_force_lut'], forcemap_im) and
+                            tsd['reward_port_start_pos'] == start_end_mm[0] and
+                            tsd['reward_port_end_pos'] == start_end_mm[1] and
+                            tsd['reward_size'] == reward_size):
+                        task_settings_dict = tsd
+                        break
+                if task_settings_dict is None:
+                    task_settings_dict = {'subject_id': subject_id,
+                                          'session': session_dict['session'],
+                                          'task_setting_id': len(task_settings_dict_list),
+                                          'target_force_lut': forcemap_im,
+                                          'reward_port_start_pos': start_end_mm[0],
+                                          'reward_port_end_pos': start_end_mm[1],
+                                          'reward_size': reward_size,
+                                          }
                     task_settings_dict_list.append(task_settings_dict)
                     add_task_parts = True
-                    
-                else:
-                    if new_task_per_bonsai_folder:
-                        new_task_settings = True
-                        add_task_parts = True
-                    else:
-                        add_task_parts = False
-                        new_task_settings = True
-                        for tsd in task_settings_dict_list:
-                            task_settings_dict = {'subject_id':subject_id,
-                                                'session':session_dict['session'],
-                                                'task_setting_id': tsd['task_setting_id'],
-                                                'target_force_lut': forcemap_im,
-                                                'reward_port_start_pos': start_end_mm[0],
-                                                'reward_port_end_pos': start_end_mm[1],
-                                                'reward_size': reward_size,
-                                                }
-                            same_dict = True
-                            for k in tsd.keys():
-                                if k=='target_force_lut':
-                                    if not np.array_equal(tsd[k],task_settings_dict[k]):
-                                        same_dict = False
-                                        break
-                                else:
-                                    if tsd[k]!=task_settings_dict[k]:
-                                        same_dict = False
-                                        break
-                            if same_dict:
-                                new_task_settings = False
-                                break
-                    
-                    if new_task_settings:
-                        task_setting_id = len(task_settings_dict_list)
-                        task_settings_dict={'subject_id':subject_id,
-                                                        'session':session_dict['session'],
-                                                        'task_setting_id': task_setting_id,
-                                                        'target_force_lut': forcemap_im,
-                                                        'reward_port_start_pos': start_end_mm[0],
-                                                        'reward_port_end_pos': start_end_mm[1],
-                                                        'reward_size': reward_size,
-                                                        }
-                        task_settings_dict_list.append(task_settings_dict)
-                        add_task_parts = True
 
                 if add_task_parts:
                     for dim in [0,1]:
@@ -412,12 +379,10 @@ def ingest_behavior_sessions(dj):
                                         'trial_start_time':trial_start_time-session_zero_time,
                                         'trial_end_time': trial_end_time-session_zero_time }
                     sessiontrial_dict_list.append(sessiontrial_dict)
-                    behaviortrial_dict = {'subject_id': sessiontrial_dict['subject_id'],              
+                    behaviortrial_dict = {'subject_id': sessiontrial_dict['subject_id'],
                                         'session':sessiontrial_dict['session'],
                                         'trial':sessiontrial_dict['trial'],
-                                        'task': task_protocol[0],
-                                        'task_protocol': task_protocol[1],
-                                        'task_setting_id': task_settings_dict['task_setting_id'],
+                                        'block': current_block,
                                         'outcome':outcome}
                     behaviortrial_dict_list.append(behaviortrial_dict)
                     #%
@@ -540,11 +505,23 @@ def ingest_behavior_sessions(dj):
                     
                 if trial_i >0:
                     trials_so_far += trial_i+1 # for multiple files in a given session
+                if len(sessiontrial_dict_list) > block_first_trial_idx:
+                    block_dict_list.append({
+                        'subject_id': subject_id,
+                        'session': session_dict['session'],
+                        'block': current_block,
+                        'task': task_protocol[0],
+                        'task_protocol': task_protocol[1],
+                        'task_setting_id': task_settings_dict['task_setting_id'],
+                        'block_start_time': sessiontrial_dict_list[block_first_trial_idx]['trial_start_time'],
+                        'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
+                    })
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
                 experiment.TaskSettings().insert(task_settings_dict_list)
                 experiment.TaskSettings.ForceAxis().insert(task_setting_dict_part_list)
+                experiment.Block().insert(block_dict_list)
                 experiment.SessionTrial().insert(sessiontrial_dict_list)
                 experiment.BehaviorTrial().insert(behaviortrial_dict_list)
                 experiment.TrialForceTrace().insert(forcetracedict_list)
