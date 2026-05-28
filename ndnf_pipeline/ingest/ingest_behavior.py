@@ -286,9 +286,6 @@ def ingest_behavior_sessions(dj):
                 
                 loadcell_si = np.median(np.diff(loadcell_t))
                 
-                # define a few session-wide parameters
-                task_protocol = ('DP',0) # ('DP', 0) is the only protocol so far. will extend, could be read from the google spreadsheet
-                
                 task_settings_dict = None
                 add_task_parts = False
                 for tsd in task_settings_dict_list:
@@ -510,9 +507,8 @@ def ingest_behavior_sessions(dj):
                         'subject_id': subject_id,
                         'session': session_dict['session'],
                         'block': current_block,
-                        'task': task_protocol[0],
-                        'task_protocol': task_protocol[1],
                         'task_setting_id': task_settings_dict['task_setting_id'],
+                        'feedback_type': 'unspecified',
                         'block_start_time': sessiontrial_dict_list[block_first_trial_idx]['trial_start_time'],
                         'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
                     })
