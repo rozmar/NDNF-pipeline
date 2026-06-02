@@ -135,6 +135,9 @@ def ingest_behavior_sessions(dj):
             calibration_dict = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell','calibration_date':calibration_date_needed}).fetch1('calibration_dict')
             p_to_g = []
             for loadcell_i in [0,1,2]:
+                if loadcell_i not in calibration_dict.keys():
+                    print('no calibration found for loadcell {} in session {}'.format(loadcell_i,session_dict))
+                    continue
                 x = calibration_dict[loadcell_i]['g']
                 y= calibration_dict[loadcell_i]['vals']
                 p = np.polyfit(x,y,1)
@@ -165,9 +168,17 @@ def ingest_behavior_sessions(dj):
                 try:
                     with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
+                    with open(os.path.join(session_dir,'other/Config/session_input.json'),'r') as f:
+                        session_info_dict = json.load(f)
                 except:
                     with open(os.path.join(session_dir,'behavior/Logs/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
+                    with open(os.path.join(session_dir,'behavior/Logs/session_output.json'),'r') as f:
+                        session_info_dict = json.load(f)
+                
+                if len(tasklogic_dict['task_parameters']['environment']['block_statistics'])>1:
+                    print('multiple blocks found in session {}, handle me!!!'.format(session_dict))
+                    asdasd
                 if data_version == 'v1':
                     #old version of data structure. -  VVVVVVVVVV
                     reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount'] # TODO make this calibrated!!!
@@ -311,7 +322,7 @@ def ingest_behavior_sessions(dj):
                     for dim in [0,1]:
                         task_setting_dict_part = {'subject_id':subject_id,
                                                 'session':session_dict['session'],
-                                                'task_setting_id':task_setting_id,
+                                                'task_setting_id':task_settings_dict['task_setting_id'],
                                                 'force_axis_idx': dim,
                                                 'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
                                                 'force_direction': calibration_dict[dim]['direction'],
@@ -319,14 +330,42 @@ def ingest_behavior_sessions(dj):
                         task_setting_dict_part_list.append(task_setting_dict_part)
                 
                 if data_version == 'v1':
-                    reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
+#                    threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['TrialOutcome']]# TODO - not set for v1!!
+                    threshold_crossing_timestamps = reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
+                
                 elif data_version in ['v2','v3']:
+                    threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
                     reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
                 reward_timestamps = np.array(reward_timestamps)
-
-                threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
                 threshold_crossing_timestamps = np.array(threshold_crossing_timestamps)
 
+
+                if data_version == 'v1':##############TODO FIX THIS!!!
+                    feedback_type = '1D_speed'
+                else:
+                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith']:
+                        feedback_type = '1D_speed'
+                    else:
+                        if '1d' in session_info_dict['notes'].lower():
+                            if 'position' in session_info_dict['notes'].lower():
+                                feedback_type = '1D_position'
+                            else:
+                                feedback_type = '1D_speed'
+                        elif '2d' in session_info_dict['notes'].lower():
+                            if 'position' in session_info_dict['notes'].lower():
+                                feedback_type = '2D_position'
+                            else:
+                                feedback_type = '2D_speed'
+                        elif 'no feedback' in session_info_dict['notes'].lower():
+                            feedback_type = '0D_speed'
+                            
+                        else:
+                            df_task_protocol_metadata = pd.read_csv(os.path.join(dj.config['path.metadata'],'NDNF behavior notes_Task_protocol_metadata.csv'))
+                            if subject_id in df_task_protocol_metadata['subject'].values:
+                                feedback_type = '1D_speed'
+                            else:
+                                asdasd
+                        
                 go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
                 go_cue_timestamps = np.array(go_cue_timestamps)
                 trial_i = 0
@@ -508,7 +547,7 @@ def ingest_behavior_sessions(dj):
                         'session': session_dict['session'],
                         'block': current_block,
                         'task_setting_id': task_settings_dict['task_setting_id'],
-                        'feedback_type': 'unspecified',
+                        'feedback_type': feedback_type,
                         'block_start_time': sessiontrial_dict_list[block_first_trial_idx]['trial_start_time'],
                         'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
                     })
