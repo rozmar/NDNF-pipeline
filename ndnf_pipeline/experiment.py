@@ -26,33 +26,6 @@ class SessionProvenance(dj.Manual):
     """
 
 @schema
-class Task(dj.Lookup):# TODO maybe these should also be in a google spreadsheet instead of lookup table
-    definition = """
-    # Type of tasks
-    task            : varchar(50)                  # task type
-    ----
-    task_description : varchar(4000)
-    """
-    contents = [
-         ('DP', 'Dynamic pull task, with a single force target to reach for water rewards from a moving reward port.'),
-         ]
-
-
-@schema
-class TaskProtocol(dj.Lookup):# TODO maybe these should also be in a google spreadsheet instead of lookup table
-    definition = """
-    # SessionType
-    -> Task
-    task_protocol : tinyint # task protocol
-    ---
-    task_protocol_description : varchar(4000)
-    """
-    contents = [
-         ('DP', 0, 'Dynamic pull basic protocol'),    
-         ]
-
-
-@schema
 class SessionTrial(dj.Manual):
     definition = """
     -> Session
@@ -78,14 +51,6 @@ class TrialNote(dj.Manual):
     ---
     trial_note  : varchar(255) 
     """
-
-# sessiontask makes no sense, probably should be dropped
-# @schema
-# class SessionTask(dj.Manual):
-#     definition = """
-#     -> Session
-#     -> TaskProtocol
-#     """
 
 @schema
 class SessionComment(dj.Manual):
@@ -137,6 +102,59 @@ class TaskSettings(dj.Manual):
         """
 
 @schema
+class FeedbackType(dj.Lookup):
+    definition = """
+    feedback_type: varchar(32)
+    ---
+    feedback_dimensions: tinyint   # 1, 2, 0=boolean/unspecified
+    feedback_modality: varchar(20) # 'speed', 'position', 'unspecified'
+    feedback_description: varchar(255)
+    """
+    contents = [
+        ('1D_speed',     1, 'speed',       '1D accumulating/speed feedback'),
+        ('1D_position',  1, 'position',    '1D instantaneous/position feedback'),
+        ('2D_speed',     2, 'speed',       '2D accumulating/speed feedback'),
+        ('2D_position',  2, 'position',    '2D instantaneous/position feedback'),
+        ('0D_position',  0, 'position',     'Reward-only boolean feedback with position'),
+        ('0D_speed',     0, 'speed',       'Reward-only boolean feedback with speed'),
+    ]
+
+@schema
+class Block(dj.Manual):
+    definition = """
+    -> Session
+    block: smallint  # block number within session, ordered chronologically
+    ---
+    -> TaskSettings
+    -> FeedbackType
+    block_start_time: decimal(10, 5)  # (s) relative to session beginning
+    block_end_time: decimal(10, 5)  # (s) relative to session beginning
+    """
+
+@schema
+class SessionStructure(dj.Computed):
+    definition = """
+    -> Session
+    ---
+    n_blocks: tinyint        # total number of blocks
+    n_trials: smallint       # total number of trials
+    n_task_settings: tinyint # distinct task settings across blocks
+    n_feedback_types: tinyint # distinct (non-unspecified) feedback types across blocks
+    n_conditions: tinyint    # distinct (task_setting, feedback_type) combinations
+    """
+
+    def make(self, key):
+        task_setting_ids, feedback_types = (Block & key).fetch('task_setting_id', 'feedback_type')
+        n_trials = len(SessionTrial & key)
+        specified = [f for f in feedback_types if f != 'unspecified']
+        self.insert1({**key,
+                      'n_blocks': len(task_setting_ids),
+                      'n_trials': n_trials,
+                      'n_task_settings': len(set(task_setting_ids)),
+                      'n_feedback_types': len(set(specified)) if specified else 0,
+                      'n_conditions': len(set(zip(task_setting_ids, feedback_types)))})
+
+@schema
 class Outcome(dj.Lookup):
     definition = """
     outcome : varchar(32)
@@ -149,8 +167,7 @@ class BehaviorTrial(dj.Manual):
     definition = """
     -> SessionTrial
     ----
-    -> TaskProtocol
-    -> TaskSettings
+    -> Block
     -> Outcome
     """
 

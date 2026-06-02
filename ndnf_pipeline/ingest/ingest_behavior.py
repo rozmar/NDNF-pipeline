@@ -15,7 +15,6 @@ _SESSION_FORMATS = [
     '%Y-%m-%dT%H%M%SZ',
     '%Y-%m-%dT%H%M%S.%fZ',
 ]
-
 def ingest_behavior_sessions(dj):
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
@@ -136,6 +135,9 @@ def ingest_behavior_sessions(dj):
             calibration_dict = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell','calibration_date':calibration_date_needed}).fetch1('calibration_dict')
             p_to_g = []
             for loadcell_i in [0,1,2]:
+                if loadcell_i not in calibration_dict.keys():
+                    print('no calibration found for loadcell {} in session {}'.format(loadcell_i,session_dict))
+                    continue
                 x = calibration_dict[loadcell_i]['g']
                 y= calibration_dict[loadcell_i]['vals']
                 p = np.polyfit(x,y,1)
@@ -145,6 +147,7 @@ def ingest_behavior_sessions(dj):
 
             task_settings_dict_list = []
             task_setting_dict_part_list = []
+            block_dict_list = []
             sessiontrial_dict_list = []
             behaviortrial_dict_list = []
             forcetracedict_list = []
@@ -157,12 +160,25 @@ def ingest_behavior_sessions(dj):
                 session_folder = session_folders[mi]
                 data_version = session_data_versions[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
+                block_first_trial_idx = len(sessiontrial_dict_list)
+                current_block = len(block_dict_list)
+                if 'behavior' not in os.listdir(session_dir):
+                    print('no behavior folder found for session {}, skipping'.format(session_dict))
+                    continue
                 try:
                     with open(os.path.join(session_dir,'other/Config/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
+                    with open(os.path.join(session_dir,'other/Config/session_input.json'),'r') as f:
+                        session_info_dict = json.load(f)
                 except:
                     with open(os.path.join(session_dir,'behavior/Logs/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
+                    with open(os.path.join(session_dir,'behavior/Logs/session_output.json'),'r') as f:
+                        session_info_dict = json.load(f)
+                
+                if len(tasklogic_dict['task_parameters']['environment']['block_statistics'])>1:
+                    print('multiple blocks found in session {}, handle me!!!'.format(session_dict))
+                    asdasd
                 if data_version == 'v1':
                     #old version of data structure. -  VVVVVVVVVV
                     reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount'] # TODO make this calibrated!!!
@@ -209,14 +225,17 @@ def ingest_behavior_sessions(dj):
                 elif data_version in ['v2','v3']:
                     cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
                     force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
-                    start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
+                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']== None:
+                        start_end_mm = [0,0]
+                    else:
+                        start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
                 distance = np.diff(start_end_mm)[0]
                 forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(lut_reference_name))
             
                 forcemap_im =Image.open(forcemap_file)
                 forcemap_im  = np.asarray(forcemap_im,float)+loadcell_offset
                 forcemap_im = forcemap_im/cached_threshold
-                forcemap_im  = forcemap_im*distance # TODO make sure this is in mm/s!!!
+                forcemap_im  = forcemap_im#*distance # TODO make sure this is in mm/s!!!
 
                 data_dict = {}
                 for file in os.listdir(os.path.join(session_dir,'behavior/SoftwareEvents/')):
@@ -278,65 +297,32 @@ def ingest_behavior_sessions(dj):
                 
                 loadcell_si = np.median(np.diff(loadcell_t))
                 
-                # define a few session-wide parameters
-                task_protocol = ('DP',0) # ('DP', 0) is the only protocol so far. will extend, could be read from the google spreadsheet
-                
-                if len(task_settings_dict_list)==0:
-                    task_setting_id = 0
-                    task_settings_dict = {'subject_id':subject_id,
-                                        'session':session_dict['session'],
-                                        'task_setting_id': task_setting_id,
-                                        'target_force_lut': forcemap_im,
-                                        'reward_port_start_pos': start_end_mm[0],
-                                        'reward_port_end_pos': start_end_mm[1],
-                                        'reward_size': reward_size,
-                                        }
+                task_settings_dict = None
+                add_task_parts = False
+                for tsd in task_settings_dict_list:
+                    if (np.array_equal(tsd['target_force_lut'], forcemap_im) and
+                            tsd['reward_port_start_pos'] == start_end_mm[0] and
+                            tsd['reward_port_end_pos'] == start_end_mm[1] and
+                            tsd['reward_size'] == reward_size):
+                        task_settings_dict = tsd
+                        break
+                if task_settings_dict is None:
+                    task_settings_dict = {'subject_id': subject_id,
+                                          'session': session_dict['session'],
+                                          'task_setting_id': len(task_settings_dict_list),
+                                          'target_force_lut': forcemap_im,
+                                          'reward_port_start_pos': start_end_mm[0],
+                                          'reward_port_end_pos': start_end_mm[1],
+                                          'reward_size': reward_size,
+                                          }
                     task_settings_dict_list.append(task_settings_dict)
                     add_task_parts = True
-                    
-                else:
-                    add_task_parts = False
-                    new_task_settings = True
-                    for tsd in task_settings_dict_list:
-                        task_settings_dict = {'subject_id':subject_id,
-                                            'session':session_dict['session'],
-                                            'task_setting_id': tsd['task_setting_id'],
-                                            'target_force_lut': forcemap_im,
-                                            'reward_port_start_pos': start_end_mm[0],
-                                            'reward_port_end_pos': start_end_mm[1],
-                                            'reward_size': reward_size,
-                                            }
-                        same_dict = True
-                        for k in tsd.keys():
-                            if k=='target_force_lut':
-                                if not np.array_equal(tsd[k],task_settings_dict[k]):
-                                    same_dict = False
-                                    break
-                            else:
-                                if tsd[k]!=task_settings_dict[k]:
-                                    same_dict = False
-                                    break
-                        if same_dict:
-                            new_task_settings = False
-                            break
-                    if new_task_settings:
-                        task_setting_id = len(task_settings_dict_list)
-                        task_settings_dict={'subject_id':subject_id,
-                                                        'session':session_dict['session'],
-                                                        'task_setting_id': task_setting_id,
-                                                        'target_force_lut': forcemap_im,
-                                                        'reward_port_start_pos': start_end_mm[0],
-                                                        'reward_port_end_pos': start_end_mm[1],
-                                                        'reward_size': reward_size,
-                                                        }
-                        task_settings_dict_list.append(task_settings_dict)
-                        add_task_parts = True
 
                 if add_task_parts:
                     for dim in [0,1]:
                         task_setting_dict_part = {'subject_id':subject_id,
                                                 'session':session_dict['session'],
-                                                'task_setting_id':task_setting_id,
+                                                'task_setting_id':task_settings_dict['task_setting_id'],
                                                 'force_axis_idx': dim,
                                                 'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
                                                 'force_direction': calibration_dict[dim]['direction'],
@@ -344,14 +330,42 @@ def ingest_behavior_sessions(dj):
                         task_setting_dict_part_list.append(task_setting_dict_part)
                 
                 if data_version == 'v1':
-                    reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
+#                    threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['TrialOutcome']]# TODO - not set for v1!!
+                    threshold_crossing_timestamps = reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
+                
                 elif data_version in ['v2','v3']:
+                    threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
                     reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
                 reward_timestamps = np.array(reward_timestamps)
-
-                threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
                 threshold_crossing_timestamps = np.array(threshold_crossing_timestamps)
 
+
+                if data_version == 'v1':##############TODO FIX THIS!!!
+                    feedback_type = '1D_speed'
+                else:
+                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith']:
+                        feedback_type = '1D_speed'
+                    else:
+                        if '1d' in session_info_dict['notes'].lower():
+                            if 'position' in session_info_dict['notes'].lower():
+                                feedback_type = '1D_position'
+                            else:
+                                feedback_type = '1D_speed'
+                        elif '2d' in session_info_dict['notes'].lower():
+                            if 'position' in session_info_dict['notes'].lower():
+                                feedback_type = '2D_position'
+                            else:
+                                feedback_type = '2D_speed'
+                        elif 'no feedback' in session_info_dict['notes'].lower():
+                            feedback_type = '0D_speed'
+                            
+                        else:
+                            df_task_protocol_metadata = pd.read_csv(os.path.join(dj.config['path.metadata'],'NDNF behavior notes_Task_protocol_metadata.csv'))
+                            if subject_id in df_task_protocol_metadata['subject'].values:
+                                feedback_type = '1D_speed'
+                            else:
+                                asdasd
+                        
                 go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
                 go_cue_timestamps = np.array(go_cue_timestamps)
                 trial_i = 0
@@ -401,12 +415,10 @@ def ingest_behavior_sessions(dj):
                                         'trial_start_time':trial_start_time-session_zero_time,
                                         'trial_end_time': trial_end_time-session_zero_time }
                     sessiontrial_dict_list.append(sessiontrial_dict)
-                    behaviortrial_dict = {'subject_id': sessiontrial_dict['subject_id'],              
+                    behaviortrial_dict = {'subject_id': sessiontrial_dict['subject_id'],
                                         'session':sessiontrial_dict['session'],
                                         'trial':sessiontrial_dict['trial'],
-                                        'task': task_protocol[0],
-                                        'task_protocol': task_protocol[1],
-                                        'task_setting_id': task_settings_dict['task_setting_id'],
+                                        'block': current_block,
                                         'outcome':outcome}
                     behaviortrial_dict_list.append(behaviortrial_dict)
                     #%
@@ -529,11 +541,22 @@ def ingest_behavior_sessions(dj):
                     
                 if trial_i >0:
                     trials_so_far += trial_i+1 # for multiple files in a given session
+                if len(sessiontrial_dict_list) > block_first_trial_idx:
+                    block_dict_list.append({
+                        'subject_id': subject_id,
+                        'session': session_dict['session'],
+                        'block': current_block,
+                        'task_setting_id': task_settings_dict['task_setting_id'],
+                        'feedback_type': feedback_type,
+                        'block_start_time': sessiontrial_dict_list[block_first_trial_idx]['trial_start_time'],
+                        'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
+                    })
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
                 experiment.TaskSettings().insert(task_settings_dict_list)
                 experiment.TaskSettings.ForceAxis().insert(task_setting_dict_part_list)
+                experiment.Block().insert(block_dict_list)
                 experiment.SessionTrial().insert(sessiontrial_dict_list)
                 experiment.BehaviorTrial().insert(behaviortrial_dict_list)
                 experiment.TrialForceTrace().insert(forcetracedict_list)
