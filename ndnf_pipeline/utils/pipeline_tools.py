@@ -7,7 +7,7 @@ import datajoint as dj
 
 
 def get_schema_name(name):
-    if name in ['lab','experiment','analysis_log']:
+    if name in ['lab','experiment','analysis_log','behavior_analysis']:
         return 'pipeline_'+name
     elif dj.config['project'] == 'foraging':
         return 'group_shared_foraging-'+name
