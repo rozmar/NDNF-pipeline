@@ -81,20 +81,20 @@ class Subject(dj.Manual):
 class WaterRestriction(dj.Manual):
     definition = """
     -> Subject
+    water_restriction_id : varchar(16)   # WR epoch identifier, e.g. WR01
     ---
-    water_restriction_id    : varchar(16)   # WR number
-    wr_start_date               : date
-    wr_start_weight             : Decimal(6,3)
+    wr_start_date        : date
+    wr_start_weight      : Decimal(4,2)  # baseline weight at start of this epoch (g)
     """
     class WaterRestrictionLog(dj.Part):
         definition = """
-        # Daily log of water restriction
         -> master
-        log_date        : date
+        log_datetime         : datetime
         ---
-        weight          : Decimal(6,3)   # weight on that day, grams
-        water_intake    : Decimal(6,3)   # water intake on that day (ml)
-        notes           : varchar(256)
+        weight               : Decimal(4,2)       # weight (g)
+        water_given          : Decimal(4,3)       # total water intake (ml)
+        water_earned = null  : Decimal(4,3)       # water earned during session (ml)
+        notes                : varchar(256)
         """
 
 
