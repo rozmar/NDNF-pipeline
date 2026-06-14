@@ -12,6 +12,7 @@ dependencies = [
     "harp-python>=0.4.1",
     "matplotlib>=3.10.8",
     "oauth2client>=4.1.3",
+    "opencv-python>=4.13.0.92",
     "pydotplus>=2.0.2",
     "scipy>=1.17.1",
 ]
