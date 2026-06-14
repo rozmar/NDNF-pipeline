@@ -303,8 +303,8 @@ class DeviceType(dj.Lookup):
     """
     contents = [
         ('camera',       'Video camera'),
-        ('load_cell',    'Force/load cell sensor'),
-        ('water_valve',  'Water reward delivery valve'),
+        ('force_sensor',    'Force/load cell sensor'),
+        ('valve',  'Water reward delivery valve'),
         ('lickometer',   'Lick detection sensor'),
     ]
 
