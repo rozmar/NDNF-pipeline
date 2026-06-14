@@ -91,6 +91,7 @@ class WaterRestriction(dj.Manual):
         -> master
         log_datetime         : datetime
         ---
+        ->Person
         weight               : Decimal(4,2)       # weight (g)
         water_given          : Decimal(4,3)       # total water intake (ml)
         water_earned = null  : Decimal(4,3)       # water earned during session (ml)
@@ -294,11 +295,26 @@ class Surgery(dj.Manual):
         effective_titer    : Decimal(20,1) # GC/ml
         """
 @schema
+class DeviceType(dj.Lookup):
+    definition = """
+    device_type                     : varchar(32)
+    ---
+    device_type_description = ''    : varchar(256)
+    """
+    contents = [
+        ('camera',       'Video camera'),
+        ('load_cell',    'Force/load cell sensor'),
+        ('water_valve',  'Water reward delivery valve'),
+        ('lickometer',   'Lick detection sensor'),
+    ]
+
+@schema
 class Device(dj.Lookup):
     definition = """
     -> Rig
     device             : varchar(32)
     ---
+    -> DeviceType
     description=''     : varchar(256)
     device_dict     : longblob
     """
