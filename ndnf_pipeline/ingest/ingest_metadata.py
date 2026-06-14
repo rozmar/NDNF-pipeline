@@ -13,9 +13,7 @@ def ingest_metadata(dj):
     ingest_mouse_lines(dj)
     ingest_surgeries(dj)
     ingest_death(dj)
-
-
-    # TODO: ingest devices and calibrations
+    ingest_water_restriction(dj)
 
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
@@ -477,6 +475,71 @@ def ingest_devices_and_calibrations(dj):
                 pass
         else:
             print('Unknown device type for calibration ingestion: ', device)
+
+def ingest_water_restriction(dj):
+    print('adding water restriction info')
+    metadata_path = dj.config['path.metadata']
+    df_surgery = pd.read_csv(metadata_path + 'NDNF procedures_Surgeries.csv')
+    df_surgery = df_surgery[1:]  # skip explanation row
+
+    # --- WaterRestriction master entries from surgery sheet ---
+    for _, item in df_surgery.iterrows():
+        start_date_val = item.get('water restriction start date (1)')
+        start_weight_val = item.get('water restriction start weight (1)')
+        if pd.isna(start_date_val) or pd.isna(start_weight_val):
+            continue
+        if not isinstance(start_date_val, str) or not isinstance(start_weight_val, (int, float, str)):
+            continue
+        try:
+            wr_start_date = datetime.strptime(str(start_date_val).strip(), '%Y/%m/%d').date()
+        except ValueError:
+            print(f"Skipping invalid WR start date for {item['Mouse ID']}: {start_date_val}")
+            continue
+        wr_dict = {
+            'subject_id':            item['Mouse ID'],
+            'water_restriction_id':  item['Mouse ID'],
+            'wr_start_date':         wr_start_date,
+            'wr_start_weight':       float(start_weight_val),
+        }
+        try:
+            lab.WaterRestriction().insert1(wr_dict)
+        except dj.errors.DuplicateError:
+            pass
+
+    # --- WaterRestrictionLog part table from dedicated CSV ---
+    df_wr = pd.read_csv(metadata_path + 'NDNF procedures_Water Restriction.csv')
+    for _, row in df_wr.iterrows():
+        subject_id     =      water_restriction_id = row['Mouse ID']
+
+
+        # skip if the master entry doesn't exist
+        if len(lab.WaterRestriction() & {'subject_id': subject_id,
+                                         'water_restriction_id': water_restriction_id}) == 0:
+            print(f'No WaterRestriction entry for {subject_id} / {water_restriction_id}, skipping log row')
+            continue
+
+        try:
+            log_datetime = datetime.strptime(str(row['Timestamp']).strip(), '%m/%d/%Y %H:%M:%S')
+        except ValueError:
+            print(f"Skipping invalid timestamp for {subject_id}: {row['Timestamp']}")
+            continue
+
+        experimenter = row['Experimenter']
+        log_dict = {
+            'subject_id':            subject_id,
+            'water_restriction_id':  water_restriction_id,
+            'log_datetime':          log_datetime,
+            'user_name':             str(experimenter),# if not pd.isna(experimenter) else None,
+            'weight':                float(row['Weight (g)']),
+            'water_given':           float(row['Water given (ml)']),
+            'water_earned':          None,
+            'notes':                 str(row['Notes']) if not pd.isna(row['Notes']) else '',
+        }
+        try:
+            lab.WaterRestriction.WaterRestrictionLog().insert1(log_dict)
+        except dj.errors.DuplicateError:
+            pass
+
 
 def ingest_death(dj):
     print('adding subject death info')
