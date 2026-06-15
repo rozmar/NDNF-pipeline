@@ -437,15 +437,34 @@ def ingest_surgeries(dj):
             surgeryidx += 1
 
 def ingest_devices_and_calibrations(dj):
+
+    print('adding devices')
+    lab.DeviceType.insert(lab.DeviceType.contents, skip_duplicates=True)
+    metadata_path = dj.config['path.metadata']
+    df_devices = pd.read_csv(metadata_path + 'NDNF experimenters_Devices.csv')
+    for _, row in df_devices.iterrows():
+        device_dict = {
+            'rig':         row['Rig ID'],
+            'device':      row['Device name'],
+            'device_type': str(row['Device type']).lower().replace(' ', '_'),
+            'description': str(row['Description']) if not pd.isna(row['Description']) else '',
+            'device_dict': {},
+        }
+        try:
+            lab.Device().insert1(device_dict)
+        except dj.errors.DuplicateError:
+            pass
+
     df_calibrations = pd.read_csv(dj.config['path.metadata']+'NDNF experimenters_Calibration.csv')
     for index, row in df_calibrations.iterrows():
         
         rig = row['Rig ID']
         device = row['Device name']
-        device_dict = {} # to hold device info
         device_dictionary = {'rig': rig,
                             'device': device,
-                            'device_dict': device_dict,
+                            'device_type': 'load_cell',
+                            'description': '',
+                            'device_dict': {},
                             }
         try:
             lab.Device().insert1(device_dictionary)
