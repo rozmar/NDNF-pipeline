@@ -283,10 +283,17 @@ def ingest_behavior_sessions(dj):
 
                 lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'))
                 loadcell_data = harp.read(os.path.join(session_dir,"behavior/LoadCells.harp/LoadCells_33.bin"))
-                csvfile = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
-                lickport_df = pd.read_csv(csvfile)
-                lickport_time = lickport_df['Seconds'].values
-                lickport_position = lickport_df['Value'].values
+                spout_csv = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
+                lickport_df = pd.read_csv(spout_csv)
+                if len(lickport_df) > 0:
+                    # motor active — use physical lickport position
+                    lickport_time     = lickport_df['Seconds'].values
+                    lickport_position = lickport_df['Value'].values
+                else:
+                    # motor off — use projected action feedback (human sessions)
+                    action_df = pd.read_csv(os.path.join(session_dir,'behavior/OperationControl/CurrentActionVector.csv'))
+                    lickport_time     = action_df['Seconds'].values
+                    lickport_position = action_df[' input.Value.Action1.Value'].values
 
                 # --- video frame times ---
                 cameras = rig_output_dict.get('triggered_camera_controller', {}).get('cameras', {})
