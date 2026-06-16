@@ -1,6 +1,6 @@
 #%
 import harp
-from .. import lab, experiment
+from .. import lab, experiment, videography
 import os
 import pandas as pd
 import numpy as np
@@ -35,6 +35,9 @@ def ingest_behavior_sessions(dj):
             experimenter = row['Experimenter']
             behavior_folder = os.path.join(dj.config['path.raw_data'],'behavior', rig,subject_id)
             session_date = datetime.strptime(row['Date'], '%Y/%m/%d').date() 
+            if not os.path.exists(behavior_folder):
+                print('no behavior folder found for subject {}, skipping'.format(subject_id))
+                continue
             session_folders_ = np.sort(os.listdir(behavior_folder))
             session_folder_dates = []
             session_folder_times = []
@@ -155,6 +158,11 @@ def ingest_behavior_sessions(dj):
             trial_event_list = []
             reward_position_dict_list = []
 
+            session_zero_time = None
+            video_recording_cameras = set()   # (rig, device) pairs seen this session
+            video_file_dicts = []
+            video_frametimes_raw = []         # list of (vf_dict, raw_frametimes)
+
             trials_so_far = 0
             for mi in matching_indices:
                 session_folder = session_folders[mi]
@@ -170,11 +178,15 @@ def ingest_behavior_sessions(dj):
                         tasklogic_dict = json.load(f)
                     with open(os.path.join(session_dir,'other/Config/session_input.json'),'r') as f:
                         session_info_dict = json.load(f)
+                    with open(os.path.join(session_dir,'other/Config/rig_input.json'),'r') as f:
+                        rig_output_dict = json.load(f)
                 except:
                     with open(os.path.join(session_dir,'behavior/Logs/tasklogic_output.json'),'r') as f:
                         tasklogic_dict = json.load(f)
                     with open(os.path.join(session_dir,'behavior/Logs/session_output.json'),'r') as f:
                         session_info_dict = json.load(f)
+                    with open(os.path.join(session_dir,'behavior/Logs/rig_input.json'),'r') as f:
+                        rig_output_dict = json.load(f)
                 
                 if len(tasklogic_dict['task_parameters']['environment']['block_statistics'])>1:
                     print('multiple blocks found in session {}, handle me!!!'.format(session_dict))
@@ -271,11 +283,50 @@ def ingest_behavior_sessions(dj):
 
                 lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'))
                 loadcell_data = harp.read(os.path.join(session_dir,"behavior/LoadCells.harp/LoadCells_33.bin"))
-                csvfile = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
-                lickport_df = pd.read_csv(csvfile)
-                lickport_time = lickport_df['Seconds'].values
-                lickport_position = lickport_df['Value'].values
-                
+                spout_csv = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
+                lickport_df = pd.read_csv(spout_csv)
+                if len(lickport_df) > 0:
+                    # motor active — use physical lickport position
+                    lickport_time     = lickport_df['Seconds'].values
+                    lickport_position = lickport_df['Value'].values
+                else:
+                    # motor off — use projected action feedback (human sessions)
+                    action_df = pd.read_csv(os.path.join(session_dir,'behavior/OperationControl/CurrentActionVector.csv'))
+                    lickport_time     = action_df['Seconds'].values
+                    lickport_position = action_df[' input.Value.Action1.Value'].values
+
+                # --- video frame times ---
+                cameras = rig_output_dict.get('triggered_camera_controller', {}).get('cameras', {})
+
+                frame_bin = os.path.join(session_dir, 'behavior', 'Behavior.harp', 'Behavior_92.bin')
+                if os.path.exists(frame_bin) and cameras:
+                    raw_frametimes = harp.read(frame_bin).index.values
+                    for camera_name in cameras:
+                        video_recording_cameras.add((rig, camera_name))
+                        video_dir = os.path.join(session_dir, 'behavior-videos', camera_name)
+                        video_path = None
+                        for fname in ['video.mkv', 'video.avi']:
+                            cand = os.path.join(video_dir, fname)
+                            if os.path.exists(cand):
+                                video_path = cand
+                                break
+                        if video_path is None:
+                            print(f'No video file found for {camera_name} in {session_folder}')
+                            continue
+                        rel_path = os.path.relpath(video_path, dj.config['path.raw_data'])
+                        vf_idx = sum(1 for v in video_file_dicts if v['device'] == camera_name)
+                        vf_dict = {
+                            'subject_id':    subject_id,
+                            'session':       session_dict['session'],
+                            'rig':           rig,
+                            'device':        camera_name,
+                            'video_file_idx': vf_idx,
+                            'file_path':     rel_path,
+                            'n_frames':      len(raw_frametimes),
+                        }
+                        video_file_dicts.append(vf_dict)
+                        video_frametimes_raw.append((vf_dict, raw_frametimes))
+
                 for pi,p in enumerate(p_to_g):
                     loadcell_data[pi] = np.polyval(p,loadcell_data[pi])
                 # TODO : DO I NEED TO CORRECT FOR OFFSET HERE???
@@ -562,7 +613,18 @@ def ingest_behavior_sessions(dj):
                 experiment.TrialForceTrace().insert(forcetracedict_list)
                 experiment.TrialForceTrace.TrialForceAxis().insert(forceaxis_dict_list)
                 experiment.TrialEvent().insert(trial_event_list)
-                experiment.TrialRewardPortPosition().insert(reward_position_dict_list)  
+                experiment.TrialRewardPortPosition().insert(reward_position_dict_list)
+                if video_recording_cameras and session_zero_time is not None:
+                    vr_dicts = [{'subject_id': subject_id, 'session': session_dict['session'],
+                                 'rig': r, 'device': cam}
+                                for r, cam in video_recording_cameras]
+                    videography.VideoRecording().insert(vr_dicts, skip_duplicates=True)
+                    videography.VideoFile().insert(video_file_dicts, skip_duplicates=True)
+                    for vf_dict, raw_ft in video_frametimes_raw:
+                        vf_key = {k: vf_dict[k] for k in ['subject_id', 'session', 'rig', 'device', 'video_file_idx']}
+                        videography.VideoFileFrameTimes().insert1(
+                            {**vf_key, 'frame_times': raw_ft - session_zero_time},
+                            skip_duplicates=True)
                 dj.conn().ping()
                 
 
