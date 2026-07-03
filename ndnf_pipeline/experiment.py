@@ -192,9 +192,30 @@ class TrialEvent(dj.Manual):
     """
 
 @schema
+class TrialMetrics(dj.Computed):
+    definition = """
+    -> BehaviorTrial
+    ---
+    trial_length: float          # (s) trial_end_time - trial_start_time
+    time_to_reward = null: float # (s) from trial start to threshold crossing, null if unrewarded
+    """
+
+    def make(self, key):
+        trial_start, trial_end = (SessionTrial & key).fetch1('trial_start_time', 'trial_end_time')
+        trial_length = float(trial_end) - float(trial_start)
+
+        events = (TrialEvent & key & {'trial_event_type': 'threshold crossing'}).fetch(
+            'trial_event_time', order_by='trial_event_id'
+        )
+        time_to_reward = float(events[0]) if len(events) > 0 else None
+
+        self.insert1({**key, 'trial_length': trial_length, 'time_to_reward': time_to_reward})
+
+
+@schema
 class TrialForceTrace(dj.Manual):
     definition = """
-    -> BehaviorTrial 
+    -> BehaviorTrial
     ---
     force_trace_time: longblob  # (s) from trial start
     """
