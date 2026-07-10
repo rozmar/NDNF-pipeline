@@ -550,6 +550,7 @@ def ingest_water_restriction(dj):
             'log_datetime':          log_datetime,
             'user_name':             str(experimenter),# if not pd.isna(experimenter) else None,
             'weight':                float(row['Weight (g)']),
+            'weight_after_watering': float(row['Weight after watering (g)']), # if not pd.isna(row['Weight after watering (g)']) else None,
             'water_given':           float(row['Water given (ml)']),
             'water_earned':          None,
             'notes':                 str(row['Notes']) if not pd.isna(row['Notes']) else '',
