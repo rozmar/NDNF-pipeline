@@ -195,3 +195,93 @@ class TrialTouchTimes(dj.Computed):
 
         self.insert1({**key, 'n_touch_epochs': epoch_counters[True]})
         self.TouchEpoch.insert(epochs)
+
+
+@schema
+class BlockStatisticsTouch(dj.Computed):
+    definition = """
+    -> experiment.Block
+    -> TouchDetectionParams
+    ---
+    touch_time_first_reward: float        # (s) total touch time in the first rewarded trial
+    touch_time_last_rewards = null: float # (s) median total touch time over last 5 rewarded trials
+    n_rewarded_trials: smallint
+    """
+
+    class ExpFit(dj.Part):
+        definition = """
+        -> master
+        ---
+        first_trial_value: float  # (s) fitted touch time at trial 0
+        steady_state: float       # (s) asymptotic touch time
+        time_constant: float      # (trials) exponential time constant tau
+        r_squared: float
+        """
+
+    class InvFit(dj.Part):
+        definition = """
+        -> master
+        ---
+        first_trial_value: float  # (s) fitted touch time at trial 0
+        steady_state: float       # (s) asymptotic touch time
+        time_constant: float      # (trials) 1/x time constant
+        r_squared: float
+        """
+
+    @property
+    def key_source(self):
+        return experiment.Block * TouchDetectionParams & TrialTouchTimes
+
+    def make(self, key):
+        rewarded_trials = (
+            experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
+            & key & {'trial_event_type': 'threshold crossing'}
+        ).fetch('trial', order_by='trial')
+
+        if len(rewarded_trials) == 0:
+            return
+
+        touch_times = np.array([
+            float((TrialTouchTimes.TouchEpoch() & key & {'trial': int(t), 'is_touch': True}
+                   ).fetch('duration').astype(float).sum())
+            for t in rewarded_trials
+        ])
+
+        first_trial = int((experiment.BehaviorTrial() & key).fetch('trial').min())
+        trial_in_block = (rewarded_trials - first_trial).astype(float)
+
+        touch_time_last = float(np.median(touch_times[-6:-1])) if len(touch_times) >= 6 else np.nan
+
+        self.insert1({**key,
+                      'touch_time_first_reward': float(touch_times[0]),
+                      'touch_time_last_rewards': touch_time_last,
+                      'n_rewarded_trials': len(rewarded_trials)})
+
+        if len(rewarded_trials) < 4:
+            return
+
+        t = trial_in_block
+        y = touch_times
+        p0 = [y[0], y[-1], max(len(t) / 3, 1.0)]
+        bounds = ([0, 0, 0.1], [np.inf, np.inf, np.inf])
+
+        def exp_decay(t, first_val, steady_state, tau):
+            return steady_state + (first_val - steady_state) * np.exp(-t / tau)
+
+        def inv_decay(t, first_val, steady_state, tau):
+            return steady_state + (first_val - steady_state) * tau / (t + tau)
+
+        for fit_fn, part_table in [(exp_decay, self.ExpFit()), (inv_decay, self.InvFit())]:
+            try:
+                popt, _ = curve_fit(fit_fn, t, y, p0=p0, bounds=bounds, maxfev=5000)
+                y_pred = fit_fn(t, *popt)
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r_squared = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+                part_table.insert1({**key,
+                                    'first_trial_value': float(popt[0]),
+                                    'steady_state': float(popt[1]),
+                                    'time_constant': float(popt[2]),
+                                    'r_squared': r_squared})
+            except RuntimeError:
+                pass
