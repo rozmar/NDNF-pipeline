@@ -1,10 +1,41 @@
 #%% experimenters
+import os
+import re
+import glob
 import pandas as pd
 #import ndnf_pipeline.lab as lab
-from .. import lab
+from .. import lab, environment
 from datetime import datetime
 from datetime import timedelta
 import numpy as np
+
+# The sensor placement log uses 'IEM' for the institute; lab.Institute uses 'KOKI'
+# for the same place (Institute of Experimental Medicine, Budapest). Add more
+# aliases here if other spreadsheets use different abbreviations.
+_SENSOR_INSTITUTE_ALIASES = {
+    'IEM': 'KOKI',
+}
+
+# Synced from Google Drive like the other metadata spreadsheets (see
+# ndnf_pipeline.utils.google_notebook.update_metadata), which saves each tab as
+# '<Spreadsheet Name>_<Tab Name>.csv'
+_SENSOR_LOCATIONS_FILENAME = 'NDNF sensor locations_Sheet1.csv'
+
+# Sensor summary files are named like 'NDNF-_3_2026-06_summary.csv' -> sensor
+# NDNF-#3, month 2026-06.
+_SENSOR_RECORDING_FILENAME_RE = re.compile(r'NDNF-?_?#?(\d+)_(\d{4}-\d{2})_summary\.csv$')
+
+# channel prefixes as they appear in the summary CSV header, e.g. 'Temperature_avg'
+_SENSOR_CHANNELS = ['Temperature', 'Humidity', 'Light', 'Voltage', 'WIFI RSSI']
+def _to_float_or_none(value):
+    """Convert a spreadsheet cell to float, treating blanks/'-' placeholders as None."""
+    if pd.isna(value):
+        return None
+    value_str = str(value).strip()
+    if value_str in ('', '-'):
+        return None
+    return float(value_str)
+
 def ingest_metadata(dj):
     ingest_experimenters(dj)
     ingest_rigs(dj)
@@ -14,6 +45,7 @@ def ingest_metadata(dj):
     ingest_surgeries(dj)
     ingest_death(dj)
     ingest_water_restriction(dj)
+    ingest_environment(dj)
 
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
@@ -550,7 +582,7 @@ def ingest_water_restriction(dj):
             'log_datetime':          log_datetime,
             'user_name':             str(experimenter),# if not pd.isna(experimenter) else None,
             'weight':                float(row['Weight (g)']),
-            'weight_after_watering': float(row['Weight after watering (g)']), # if not pd.isna(row['Weight after watering (g)']) else None,
+            'weight_after_watering': _to_float_or_none(row['Weight after watering (g)']),
             'water_given':           float(row['Water given (ml)']),
             'water_earned':          None,
             'notes':                 str(row['Notes']) if not pd.isna(row['Notes']) else '',
@@ -604,4 +636,138 @@ def ingest_death(dj):
             print(f"Error inserting death info for animal {item['animal#']}: {e}")
 
 
-                    
+def ingest_environment(dj):
+    ingest_sensor_placements(dj)
+    ingest_sensor_recordings(dj)
+
+
+def ingest_sensor_placements(dj):
+    """
+    Parses the sensor placement/location log (one row per time a sensor was
+    moved) and populates environment.EnvSensor + environment.EnvSensor.EnvSensorPlacement
+    (EnvSensorPlacement is a Part table of EnvSensor).
+
+    Expected columns: Sensor ID, Institute, Building, Room, Sensor location,
+    Rig, Date, Comment
+    """
+    metadata_path = dj.config['path.metadata']
+    df_locations = pd.read_csv(metadata_path + _SENSOR_LOCATIONS_FILENAME)
+
+    print('adding environment sensors and placements')
+    for _, row in df_locations.iterrows():
+        sensor_id = row['Sensor ID']
+
+        try:
+            environment.EnvSensor().insert1({'sensor_id': sensor_id})
+        except dj.errors.DuplicateError:
+            pass
+
+        institute_id = row['Institute']
+        institute_id = _SENSOR_INSTITUTE_ALIASES.get(institute_id, institute_id)
+        if len(lab.Institute() & {'institute_id': institute_id}) == 0:
+            print(f'Unknown institute "{row["Institute"]}" for sensor {sensor_id}, skipping placement row')
+            continue
+
+        try:
+            placement_date = datetime.strptime(str(row['Date']).strip(), '%Y/%m/%d').date()
+        except ValueError:
+            print(f'Skipping invalid placement date for sensor {sensor_id}: {row["Date"]}')
+            continue
+
+        rig = row['Rig']
+        if not isinstance(rig, str) or rig.strip() in ('', '-'):
+            rig = None
+        else:
+            rig = rig.strip()
+            if len(lab.Rig() & {'rig': rig}) == 0:
+                print(f'Unknown rig "{rig}" for sensor {sensor_id}, storing placement without rig link')
+                rig = None
+
+        placementdata = {
+            'sensor_id':            sensor_id,
+            'placement_date':       placement_date,
+            'institute_id':         institute_id,
+            'building':             row['Building'],
+            'room':                 str(row['Room']),
+            'location_description': row['Sensor location'] if not pd.isna(row['Sensor location']) else '',
+            'rig':                  rig,
+            'placement_comment':    row['Comment'] if not pd.isna(row['Comment']) else '',
+        }
+        try:
+            environment.EnvSensor.EnvSensorPlacement().insert1(placementdata)
+        except dj.errors.DuplicateError:
+            print(f'duplicate placement for sensor {sensor_id} on {placement_date}, already exists')
+
+
+def ingest_sensor_recordings(dj):
+    """
+    Parses hourly summary CSVs exported from the sensor dashboard, one file
+    per sensor per month, named like 'NDNF-_3_2026-06_summary.csv'.
+
+    Expects columns: datetime, <Channel>_avg, <Channel>_min, <Channel>_max,
+    <Channel>_count for each channel in _SENSOR_CHANNELS.
+    """
+    environment.EnvSensorChannel.insert(environment.EnvSensorChannel.contents, skip_duplicates=True)
+
+    data_path = os.path.join(dj.config['path.metadata'], 'environment_sensors')
+    files = sorted(glob.glob(os.path.join(data_path, '*_summary.csv')))
+
+    for file_path in files:
+        fname = os.path.basename(file_path)
+        match = _SENSOR_RECORDING_FILENAME_RE.search(fname)
+        if not match:
+            print(f'Could not parse sensor id / month from filename "{fname}", skipping')
+            continue
+        sensor_id = 'NDNF-#{}'.format(match.group(1))
+
+        if len(environment.EnvSensor() & {'sensor_id': sensor_id}) == 0:
+            print(f'No EnvSensor entry for {sensor_id} (from file {fname}); '
+                  f'run ingest_sensor_placements first, skipping')
+            continue
+
+        df = pd.read_csv(file_path)
+        df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+
+        # skip datetimes already ingested for this sensor
+        existing_datetimes = set(
+            (environment.EnvSensorRecording() & {'sensor_id': sensor_id}).fetch('recording_datetime'))
+
+        recording_dict_list = []
+        channel_dict_list = []
+        for _, row in df.iterrows():
+            recording_datetime = row['datetime'].to_pydatetime().replace(tzinfo=None)  # store as UTC-naive
+            if recording_datetime in existing_datetimes:
+                continue
+
+            row_channel_dicts = []
+            for channel in _SENSOR_CHANNELS:
+                avg_col = f'{channel}_avg'
+                if avg_col not in row or pd.isna(row[avg_col]):
+                    continue
+                row_channel_dicts.append({
+                    'sensor_id':          sensor_id,
+                    'recording_datetime': recording_datetime,
+                    'channel_name':       channel.replace(' ', '_'),
+                    'value_avg':          float(row[avg_col]),
+                    'value_min':          float(row[f'{channel}_min']),
+                    'value_max':          float(row[f'{channel}_max']),
+                    'sample_count':       int(row[f'{channel}_count']),
+                })
+            if not row_channel_dicts:
+                continue
+
+            recording_dict_list.append({
+                'sensor_id':          sensor_id,
+                'recording_datetime': recording_datetime,
+            })
+            channel_dict_list.extend(row_channel_dicts)
+
+        if not recording_dict_list:
+            print(f'no new recordings for {sensor_id} in {fname}')
+            continue
+
+        print(f'adding {len(recording_dict_list)} recordings for {sensor_id} from {fname}')
+        with dj.conn().transaction:
+            environment.EnvSensorRecording().insert(recording_dict_list, skip_duplicates=True)
+            environment.EnvSensorRecording.Channel().insert(channel_dict_list, skip_duplicates=True)
+            dj.conn().ping()
