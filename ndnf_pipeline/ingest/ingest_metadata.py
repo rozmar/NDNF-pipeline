@@ -561,7 +561,8 @@ def ingest_water_restriction(dj):
     df_wr = pd.read_csv(metadata_path + 'NDNF procedures_Water Restriction.csv')
     for _, row in df_wr.iterrows():
         subject_id     =      water_restriction_id = row['Mouse ID']
-
+        if not isinstance(subject_id, str):
+            continue
 
         # skip if the master entry doesn't exist
         if len(lab.WaterRestriction() & {'subject_id': subject_id,

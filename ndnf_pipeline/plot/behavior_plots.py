@@ -1,0 +1,328 @@
+import os
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import numpy as np
+
+DEFAULT_UNIFORM_FORCE_RANGE = np.asarray([-1, 1, -1, 1]) * 10
+
+
+def _get_block_force_axes(experiment, subject_id, session, task_setting_id):
+    # figure out which raw loadcell axis/direction is LR and which is PA
+    force_axes = (experiment.TaskSettings.ForceAxis() & {'subject_id': subject_id, 'session': session, 'task_setting_id': task_setting_id}).fetch(as_dict=True)
+    force_axes_dict = {}
+    for fa in force_axes:
+        force_axes_dict[fa['force_axis_idx']] = {'force_direction': fa['force_direction'],
+                                                   'target_force_axes': fa['target_force_axes']}
+    lr_idx = next(i for i in force_axes_dict if force_axes_dict[i]['force_direction'] in ('LR', 'RL'))
+    pa_idx = next(i for i in force_axes_dict if force_axes_dict[i]['force_direction'] in ('PA', 'AP'))
+    lr_sign = -1 if force_axes_dict[lr_idx]['force_direction'] == 'RL' else 1
+    pa_sign = -1 if force_axes_dict[pa_idx]['force_direction'] == 'AP' else 1
+    return force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign
+
+
+def _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign):
+    # normalize a raw target_force_lut to X=Left-Right (L<0, R>0), Y=Posterior-Anterior (P<0, A>0)
+    lr_ax = lr_sign * force_axes_dict[lr_idx]['target_force_axes']
+    pa_ax = pa_sign * force_axes_dict[pa_idx]['target_force_axes']
+    lr_extent = [float(lr_ax.min()), float(lr_ax.max())]
+    pa_extent = [float(pa_ax.min()), float(pa_ax.max())]
+
+    lut = target_force_lut.copy()
+    if lr_sign == -1:
+        lut = lut[:, ::-1] if lr_idx == 0 else lut[::-1, :]
+    if pa_sign == -1:
+        lut = lut[:, ::-1] if pa_idx == 0 else lut[::-1, :]
+    if lr_idx == 1:
+        lut = lut.T
+
+    lut_extent = [lr_extent[0], lr_extent[1], pa_extent[0], pa_extent[1]]
+    return lut, lut_extent, lr_extent, pa_extent
+
+
+def _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign):
+    lr_traces = [lr_sign * f for f in (force_traces_0 if lr_idx == 0 else force_traces_1)]
+    pa_traces = [pa_sign * f for f in (force_traces_1 if pa_idx == 1 else force_traces_0)]
+    return lr_traces, pa_traces
+
+
+def _force_histogram(lr_traces, pa_traces, histrange, bins=50):
+    # log-density 2D histogram of force, with -inf (empty bins) clipped to the finite minimum
+    try:
+        forcehist, binx, biny = np.histogram2d(
+            np.concatenate(lr_traces), np.concatenate(pa_traces),
+            range=histrange, bins=bins)
+        forcehist = np.log(forcehist / forcehist.sum())
+        forcehist_ = forcehist.copy()
+        forcehist_[np.isinf(forcehist)] = 0
+        forcehist[np.isinf(forcehist)] = np.nanmin(forcehist_.flatten())
+        return forcehist, binx, biny
+    except Exception:
+        return None, None, None
+
+
+def _fill_lut_background(ax, lut, uniform_force_range, vmin=None, vmax=None, cmap='viridis'):
+    # when the forced uniform view range is larger than the LUT's own native extent,
+    # fill the rest of the view with one of the LUT's own corner values (its background
+    # level) instead of a fixed number, so the margins don't look like blank white edges.
+    # vmin/vmax must match whatever clim the real LUT imshow uses, otherwise this fill
+    # value renders under its own independent color scaling and can look wrong (e.g. a
+    # high corner value rendering as a dark background instead of a bright one)
+    background_value = lut[0, 0]
+    ax.imshow(np.ones_like(lut) * background_value, extent=uniform_force_range,
+              cmap=cmap, vmin=vmin, vmax=vmax, alpha=1)
+
+
+def _plot_force_trajectories(ax, lr_traces, pa_traces, force_uniform_range=True, uniform_force_range=None,
+                              title='Force trajectories (early=blue, late=red)', ylabel=True, add_colorbar=True):
+    # trajectories color-coded by trial (early=blue, late=red); shared by the blockwise
+    # and sessionwise plots
+    if uniform_force_range is None:
+        uniform_force_range = DEFAULT_UNIFORM_FORCE_RANGE
+    n_trials = len(lr_traces)
+    cmap_traj = cm.coolwarm
+    for i, (lr, pa) in enumerate(zip(lr_traces, pa_traces)):
+        color = cmap_traj(i / max(n_trials - 1, 1))
+        ax.plot(lr, pa, '-', color=color, alpha=0.5, linewidth=0.6)
+    if force_uniform_range:
+        ax.set_xlim(uniform_force_range[:2])
+        ax.set_ylim(uniform_force_range[2:])
+    ax.set_xlabel('Left - Right (g)')
+    if ylabel:
+        ax.set_ylabel('Posterior - Anterior (g)')
+    if title:
+        ax.set_title(title)
+    if add_colorbar:
+        sm = cm.ScalarMappable(cmap=cmap_traj, norm=plt.Normalize(vmin=1, vmax=max(n_trials, 1)))
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='trial #')
+    return ax
+
+
+def plot_block_force_figure(subject_id, session, block, subtract_force_median=True,
+                             force_uniform_range=True, uniform_force_range=None, fig_dir=None):
+    """4-panel figure for one block: target LUT, performance, force distribution, force trajectories.
+
+    X is always Left-Right (L<0, R>0) and Y is always Posterior-Anterior (P<0, A>0),
+    regardless of which raw loadcell axis/direction the rig recorded.
+
+    If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_b{block}.png'.
+    Returns the figure.
+    """
+    # imported lazily: importing experiment.py at module load time would force a live
+    # DataJoint connection as soon as `ndnf_pipeline.plot` is imported
+    from ndnf_pipeline import experiment
+
+    if uniform_force_range is None:
+        uniform_force_range = DEFAULT_UNIFORM_FORCE_RANGE
+
+    key = {'subject_id': subject_id, 'session': session, 'block': block}
+    feedback_type = (experiment.Block() & key).fetch1('feedback_type')
+    session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': session}).fetch1('session_date', 'session_time')
+    task_setting_id, target_force_lut = (experiment.TaskSettings() * experiment.Block() & key).fetch1('task_setting_id', 'target_force_lut')
+    force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, session, task_setting_id)
+    lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+
+    fig = plt.figure(figsize=(12, 12))
+    ax_target_LUT = fig.add_subplot(2, 2, 1)
+
+    lut_vmin, lut_vmax = np.min(lut), np.max(lut)
+    if force_uniform_range:
+        _fill_lut_background(ax_target_LUT, lut, uniform_force_range, vmin=lut_vmin, vmax=lut_vmax)
+    ax_target_LUT.imshow(lut, extent=lut_extent, origin='lower',
+                          cmap='viridis', aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
+    ax_target_LUT.set_xlabel('Left - Right (g)')
+    ax_target_LUT.set_ylabel('Posterior - Anterior (g)')
+    if force_uniform_range:
+        ax_target_LUT.set_xlim(uniform_force_range[:2])
+        ax_target_LUT.set_ylim(uniform_force_range[2:])
+    plt.colorbar(ax_target_LUT.images[-1], ax=ax_target_LUT, label='reward port speed')
+    ax_target_LUT.set_title(f'{subject_id} s{session} b{block}: {feedback_type}')
+
+    ax_performance = fig.add_subplot(2, 2, 3)
+    rewarded_trial, time_to_reward = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'trial_event_type': 'threshold crossing'}).fetch('trial', 'trial_event_time')
+    ax_performance.set_xlabel('trial#')
+    ax_performance.plot(rewarded_trial, time_to_reward, 'g.')
+    if len(rewarded_trial) > 10:
+        ax_performance.plot(np.convolve(rewarded_trial, np.ones(10) / 10, mode='valid'),
+                             np.convolve(np.asarray(time_to_reward, float), np.ones(10) / 10, mode='valid'), 'g-')
+    ax_performance.set_ylabel('time to get reward')
+
+    ax_force_hist = fig.add_subplot(2, 2, 2)
+    force_traces_0_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0}).fetch('force_trace_value')
+    force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 1}).fetch('force_trace_value')
+    if subtract_force_median:
+        f0_baseline = np.median(np.concatenate(force_traces_0_))
+        f1_baseline = np.median(np.concatenate(force_traces_1_))
+        force_traces_0 = [f - f0_baseline for f in force_traces_0_]
+        force_traces_1 = [f - f1_baseline for f in force_traces_1_]
+    else:
+        force_traces_0 = list(force_traces_0_)
+        force_traces_1 = list(force_traces_1_)
+
+    lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
+
+    histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
+    forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
+    if forcehist is not None:
+        im_hist = ax_force_hist.imshow(forcehist.T, origin='lower',
+                                        extent=[binx[0], binx[-1], biny[0], biny[-1]],
+                                        aspect='auto', alpha=1)
+        ax_force_hist.set_xlabel('Left - Right (g)')
+        ax_force_hist.set_ylabel('Posterior - Anterior (g)')
+        plt.colorbar(im_hist, ax=ax_force_hist, label='fraction of time spent')
+    ax_force_hist.set_title(f'{session_date} {session_time}')
+
+    ax_traj = fig.add_subplot(2, 2, 4)
+    _plot_force_trajectories(ax_traj, lr_traces, pa_traces, force_uniform_range, uniform_force_range)
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_b{block}.png'), dpi=150)
+
+    return fig
+
+
+def plot_session_blocks_overview(subject_id, session, subtract_force_median=True,
+                                  force_uniform_range=True, uniform_force_range=None, fig_dir=None):
+    """Session-level overview across all of a session's blocks.
+
+    Row 1: time-to-reward for every trial in the session (one panel), with each
+           block's trial range highlighted and color-coded.
+    Row 2: each block's target LUT, side by side, sharing the same axes and colormap.
+    Row 3: each block's force distribution histogram, side by side, sharing the
+           same axes and colormap.
+    Row 4: each block's force trajectories (early=blue, late=red), side by side.
+
+    X is always Left-Right (L<0, R>0) and Y is always Posterior-Anterior (P<0, A>0).
+
+    If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_blocks_overview.png'.
+    Returns the figure.
+    """
+    from ndnf_pipeline import experiment
+
+    if uniform_force_range is None:
+        uniform_force_range = DEFAULT_UNIFORM_FORCE_RANGE
+
+    available_blocks = np.sort((experiment.Block() & {'subject_id': subject_id, 'session': session}).fetch('block'))
+    n_blocks = len(available_blocks)
+    session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': session}).fetch1('session_date', 'session_time')
+    block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
+
+    # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax ---
+    block_data = []
+    for block in available_blocks:
+        key = {'subject_id': subject_id, 'session': session, 'block': block}
+        task_setting_id, target_force_lut = (experiment.TaskSettings() * experiment.Block() & key).fetch1('task_setting_id', 'target_force_lut')
+        force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, session, task_setting_id)
+        lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+
+        force_traces_0_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0}).fetch('force_trace_value')
+        force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 1}).fetch('force_trace_value')
+        if subtract_force_median:
+            f0_baseline = np.median(np.concatenate(force_traces_0_))
+            f1_baseline = np.median(np.concatenate(force_traces_1_))
+            force_traces_0 = [f - f0_baseline for f in force_traces_0_]
+            force_traces_1 = [f - f1_baseline for f in force_traces_1_]
+        else:
+            force_traces_0 = list(force_traces_0_)
+            force_traces_1 = list(force_traces_1_)
+        lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
+
+        histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
+        forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
+
+        rewarded_trial, time_to_reward = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'trial_event_type': 'threshold crossing'}).fetch('trial', 'trial_event_time')
+        block_trials = (experiment.BehaviorTrial() & key).fetch('trial')
+
+        block_data.append(dict(block=block, lut=lut, lut_extent=lut_extent,
+                                forcehist=forcehist, binx=binx, biny=biny,
+                                lr_traces=lr_traces, pa_traces=pa_traces,
+                                rewarded_trial=rewarded_trial, time_to_reward=time_to_reward,
+                                block_trials=block_trials))
+
+    lut_vmin = min(np.min(bd['lut']) for bd in block_data)
+    lut_vmax = max(np.max(bd['lut']) for bd in block_data)
+    hist_vals = [bd['forcehist'] for bd in block_data if bd['forcehist'] is not None]
+    hist_vmin = min(np.min(h) for h in hist_vals) if hist_vals else None
+    hist_vmax = max(np.max(h) for h in hist_vals) if hist_vals else None
+
+    fig = plt.figure(figsize=(4 * max(n_blocks, 1), 13))
+    gs = plt.GridSpec(4, max(n_blocks, 1), figure=fig, height_ratios=[1, 1.1, 1.1, 1.1], hspace=0.5, wspace=0.3)
+
+    # --- row 1: time to reward across the whole session, blocks highlighted ---
+    ax_perf = fig.add_subplot(gs[0, :])
+    for bd, color in zip(block_data, block_colors):
+        if len(bd['block_trials']):
+            ax_perf.axvspan(bd['block_trials'].min() - 0.5, bd['block_trials'].max() + 0.5, color=color, alpha=0.15)
+        ax_perf.plot(bd['rewarded_trial'], bd['time_to_reward'], '.', color=color, label=f"block {bd['block']}")
+        if len(bd['rewarded_trial']) > 10:
+            ax_perf.plot(np.convolve(bd['rewarded_trial'], np.ones(10) / 10, mode='valid'),
+                         np.convolve(np.asarray(bd['time_to_reward'], float), np.ones(10) / 10, mode='valid'),
+                         '-', color=color)
+    ax_perf.set_xlabel('trial#')
+    ax_perf.set_ylabel('time to get reward')
+    ax_perf.set_title(f'{subject_id} s{session}  {session_date} {session_time}')
+    ax_perf.legend(loc='upper right', fontsize=8, ncol=min(max(n_blocks, 1), 6))
+
+    # --- row 2: target LUTs side by side, shared axes + colormap ---
+    axes_lut = []
+    im_lut = None
+    for bi, (bd, color) in enumerate(zip(block_data, block_colors)):
+        ax_lut = fig.add_subplot(gs[1, bi])
+        if force_uniform_range:
+            _fill_lut_background(ax_lut, bd['lut'], uniform_force_range, vmin=lut_vmin, vmax=lut_vmax)
+        im_lut = ax_lut.imshow(bd['lut'], extent=bd['lut_extent'], origin='lower', cmap='viridis',
+                                aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
+        if force_uniform_range:
+            ax_lut.set_xlim(uniform_force_range[:2])
+            ax_lut.set_ylim(uniform_force_range[2:])
+        ax_lut.set_xlabel('Left - Right (g)')
+        if bi == 0:
+            ax_lut.set_ylabel('Posterior - Anterior (g)')
+        ax_lut.set_title(f"block {bd['block']}", color=color)
+        axes_lut.append(ax_lut)
+    if im_lut is not None:
+        fig.colorbar(im_lut, ax=axes_lut, label='reward port speed')
+
+    # --- row 3: force histograms side by side, shared axes + colormap ---
+    axes_hist = []
+    im_hist = None
+    for bi, (bd, color) in enumerate(zip(block_data, block_colors)):
+        ax_hist = fig.add_subplot(gs[2, bi])
+        if bd['forcehist'] is not None:
+            im_hist = ax_hist.imshow(bd['forcehist'].T, origin='lower',
+                                      extent=[bd['binx'][0], bd['binx'][-1], bd['biny'][0], bd['biny'][-1]],
+                                      aspect='auto', vmin=hist_vmin, vmax=hist_vmax)
+        elif force_uniform_range:
+            ax_hist.set_xlim(uniform_force_range[:2])
+            ax_hist.set_ylim(uniform_force_range[2:])
+        ax_hist.set_xlabel('Left - Right (g)')
+        if bi == 0:
+            ax_hist.set_ylabel('Posterior - Anterior (g)')
+        ax_hist.set_title(f"block {bd['block']}", color=color)
+        axes_hist.append(ax_hist)
+    if im_hist is not None:
+        fig.colorbar(im_hist, ax=axes_hist, label='fraction of time spent (log)')
+
+    # --- row 4: force trajectories side by side ---
+    # one shared colorbar for the whole row: each block's trajectories are already
+    # colored by *fractional* trial position (0=first, 1=last), so a single colorbar
+    # labeled first...last applies across blocks even though they have different trial counts
+    axes_traj = []
+    for bi, (bd, color) in enumerate(zip(block_data, block_colors)):
+        ax_traj = fig.add_subplot(gs[3, bi])
+        _plot_force_trajectories(ax_traj, bd['lr_traces'], bd['pa_traces'], force_uniform_range, uniform_force_range,
+                                  title=None, ylabel=(bi == 0), add_colorbar=False)
+        ax_traj.set_title(f"block {bd['block']}", color=color)
+        axes_traj.append(ax_traj)
+    sm_traj = cm.ScalarMappable(cmap=cm.coolwarm, norm=plt.Normalize(vmin=0, vmax=1))
+    sm_traj.set_array([])
+    cbar_traj = fig.colorbar(sm_traj, ax=axes_traj, label='trial (within block)')
+    cbar_traj.set_ticks([0, 1])
+    cbar_traj.set_ticklabels(['first', 'last'])
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_blocks_overview.png'), dpi=150)
+
+    return fig

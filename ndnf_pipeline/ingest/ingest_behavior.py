@@ -15,6 +15,107 @@ _SESSION_FORMATS = [
     '%Y-%m-%dT%H%M%SZ',
     '%Y-%m-%dT%H%M%S.%fZ',
 ]
+
+def _to_float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def _is_valid_training_type(value):
+    if pd.isna(value):
+        return False
+    value = str(value).strip()
+    return value not in ('', '-') and value.lower() != 'none'
+
+def _first_non_empty(*values):
+    for value in values:
+        if pd.isna(value):
+            continue
+        value = str(value).strip()
+        if value not in ('', '-'):
+            return value
+    return ''
+
+def _resolve_rig_for_subject(dj, subject_id):
+    # fallback for rows where the Water Restriction sheet doesn't record a Rig:
+    # find it by locating the subject's raw data folder among the known rigs
+    behavior_root = os.path.join(dj.config['path.raw_data'], 'behavior')
+    matches = [rig_candidate for rig_candidate in os.listdir(behavior_root)
+               if os.path.isdir(os.path.join(behavior_root, rig_candidate, subject_id))]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print('multiple rigs found for subject {}: {}, cannot resolve automatically'.format(subject_id, matches))
+    return None
+
+def _extract_block_trial_params(trial_statistics, data_version, tasklogic_dict, session_dict):
+    # pulls everything needed to set up a block's task settings out of a single
+    # block's trial_statistics dict (either a live ActiveBlock event or, for v1 /
+    # single-block sessions, tasklogic_dict['...']['block_statistics'][0])
+    has_cue = trial_statistics['response_period']['has_cue']
+    if data_version == 'v1':
+        #old version of data structure. -  VVVVVVVVVV
+        reward_size = trial_statistics['left_harvest']['amount'] # TODO make this calibrated!!!
+        valve_open_time = trial_statistics['left_harvest']['amount']*0.05 # TODO make this calibrated!!!
+        #old version of data structure. -   AAAAAAAAAAA
+        # # old logic here: VVVVVVVVVVVVVV
+        loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_min'],# TODO is it true that left corresponds to loadcell 0???
+                                    tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_max']],
+                                1:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_min'],
+                                    tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_max']]}
+        loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['offset']# offset and scale is also here!!
+        loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['scale']# offset and scale is also here!!
+        lut_reference_name = 'ForceLut'
+        cached_threshold = trial_statistics['left_harvest']['upper_force_threshold'] # old logic
+        force_duration = trial_statistics['left_harvest']['force_duration'] # old logic
+        start_end_mm = trial_statistics['left_harvest']['continuous_feedback']['converter_lut_output'] # old logic
+    elif data_version in ['v2','v3']:
+        reward_size = trial_statistics['response_period']['action']['reward_amount']['distribution_parameters']['value']
+        valve_open_time = reward_size*0.05 # TODO make this calibrated!!!
+        lut_reference_name = trial_statistics.get('lut_reference') or trial_statistics.get('sampler', {}).get('lut_reference')
+        if not lut_reference_name:
+            lut_reference_name = 'gaussian_2d'
+            print('No lut_reference found in tasklogic dict for session {}, using default {}'.format(session_dict,lut_reference_name))
+
+        loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_min'],# TODO is it true that left corresponds to loadcell 0???
+                                    tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_max']],
+                                1:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_min'],
+                                    tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_max']]}
+
+        loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['offset']# offset and scale is also here!!
+        loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['scale']# offset and scale is also here!!
+        cached_threshold = trial_statistics['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
+        force_duration = trial_statistics['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
+        if trial_statistics['response_period']['action']['continuous_feedback'] is None:
+            start_end_mm = [0,0]
+        else:
+            start_end_mm = trial_statistics['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
+    return {
+        'reward_size': reward_size,
+        'valve_open_time': valve_open_time,
+        'loadcell_limits_dict_': loadcell_limits_dict_,
+        'loadcell_offset': loadcell_offset,
+        'loadcell_scale': loadcell_scale,
+        'lut_reference_name': lut_reference_name,
+        'cached_threshold': cached_threshold,
+        'force_duration': force_duration,
+        'start_end_mm': start_end_mm,
+        'has_cue': has_cue,
+    }
+
+def _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict, block_num, task_setting_id, feedback_type, first_trial_idx):
+    if len(sessiontrial_dict_list) > first_trial_idx:
+        block_dict_list.append({
+            'subject_id': subject_id,
+            'session': session_dict['session'],
+            'block': block_num,
+            'task_setting_id': task_setting_id,
+            'feedback_type': feedback_type,
+            'block_start_time': sessiontrial_dict_list[first_trial_idx]['trial_start_time'],
+            'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
+        })
+
 def ingest_behavior_sessions(dj):
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
@@ -25,16 +126,64 @@ def ingest_behavior_sessions(dj):
     df_surgery = df_surgery[1:] # skip explanation row
     subject_ids = df_surgery['Mouse ID'].tolist()
     metadata_files = os.listdir(dj.config['path.metadata'])
+
+    # sessions with a training type are also logged in the Water Restriction sheet;
+    # for subjects whose old-style behavior notes file is no longer maintained, this
+    # is the only place recent sessions show up
+    df_wr_all = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Water Restriction.csv')
+    df_wr_all = df_wr_all[df_wr_all['Training type'].apply(_is_valid_training_type)]
+
     for subject_id in subject_ids:
-        if 'NDNF behavior notes_{}.csv'.format(subject_id) not in metadata_files:
+        session_rows = []
+        if 'NDNF behavior notes_{}.csv'.format(subject_id) in metadata_files:
+            df_subject = pd.read_csv(dj.config['path.metadata']+'NDNF behavior notes_{}.csv'.format(subject_id))
+            for _, row in df_subject.iterrows():
+                session_rows.append({
+                    'rig': row['Rig'],
+                    'experimenter': row['Experimenter'],
+                    'session_date': datetime.strptime(row['Date'], '%Y/%m/%d').date(),
+                    'weight': _to_float_or_none(row['Weight']),
+                    'water_earned': _to_float_or_none(row['Water during experiment']),
+                    'water_extra': _to_float_or_none(row['Extra water']),
+                    'comment': row['Comment'],
+                })
+
+        known_dates = {sr['session_date'] for sr in session_rows}
+
+        df_wr_subject = df_wr_all[df_wr_all['Mouse ID'] == subject_id]
+        for _, row in df_wr_subject.iterrows():
+            try:
+                session_date = datetime.strptime(str(row['Timestamp']).strip(), '%m/%d/%Y %H:%M:%S').date()
+            except ValueError:
+                print('Skipping invalid Water Restriction timestamp for subject {}: {}'.format(subject_id, row['Timestamp']))
+                continue
+            if session_date in known_dates:
+                # already represented in the behavior notes file, don't double-upload
+                continue
+            known_dates.add(session_date)
+            rig = row['Rig'] if not pd.isna(row['Rig']) else _resolve_rig_for_subject(dj, subject_id)
+            if pd.isna(rig):
+                print('could not determine rig for subject {} on {}, skipping session'.format(subject_id, session_date))
+                continue
+            session_rows.append({
+                'rig': rig,
+                'experimenter': row['Experimenter'],
+                'session_date': session_date,
+                'weight': _to_float_or_none(row['Weight (g)']),
+                'water_earned': _to_float_or_none(row['Water earned during the task (ml)']),
+                'water_extra': _to_float_or_none(row['Water given (ml)']),
+                'comment': _first_non_empty(row.get('Behavior notes'), row.get('Notes')),
+            })
+
+        if not session_rows:
             print('no behavior sessions for subject {}'.format(subject_id))
             continue
-        df_subject = pd.read_csv(dj.config['path.metadata']+'NDNF behavior notes_{}.csv'.format(subject_id))
-        for index, row in df_subject.iterrows():
-            rig= row['Rig']
-            experimenter = row['Experimenter']
+
+        for session_row in session_rows:
+            rig = session_row['rig']
+            experimenter = session_row['experimenter']
             behavior_folder = os.path.join(dj.config['path.raw_data'],'behavior', rig,subject_id)
-            session_date = datetime.strptime(row['Date'], '%Y/%m/%d').date() 
+            session_date = session_row['session_date']
             if not os.path.exists(behavior_folder):
                 print('no behavior folder found for subject {}, skipping'.format(subject_id))
                 continue
@@ -109,12 +258,12 @@ def ingest_behavior_sessions(dj):
                                 'execution_log_id': execution_log_id}
                 session_details_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
-                                        'session_weight': row['Weight'],
-                                        'session_water_earned': row['Water during experiment'],
-                                        'session_water_extra': row['Extra water']}
+                                        'session_weight': session_row['weight'],
+                                        'session_water_earned': session_row['water_earned'],
+                                        'session_water_extra': session_row['water_extra']}
                 session_comment_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
-                                        'session_comment': row['Comment']}
+                                        'session_comment': session_row['comment']}
                 if type(session_comment_dict['session_comment']) is not str:
                     session_comment_dict['session_comment'] = ''
                 
@@ -149,6 +298,7 @@ def ingest_behavior_sessions(dj):
                 p_to_g.append(np.polyfit(y,x,1))
 
             task_settings_dict_list = []
+            task_settings_axis_limits_list = []  # parallel to task_settings_dict_list; not inserted into the DB
             task_setting_dict_part_list = []
             block_dict_list = []
             sessiontrial_dict_list = []
@@ -168,8 +318,6 @@ def ingest_behavior_sessions(dj):
                 session_folder = session_folders[mi]
                 data_version = session_data_versions[mi]
                 session_dir = os.path.join(behavior_folder,session_folder)
-                block_first_trial_idx = len(sessiontrial_dict_list)
-                current_block = len(block_dict_list)
                 if 'behavior' not in os.listdir(session_dir):
                     print('no behavior folder found for session {}, skipping'.format(session_dict))
                     continue
@@ -187,67 +335,6 @@ def ingest_behavior_sessions(dj):
                         session_info_dict = json.load(f)
                     with open(os.path.join(session_dir,'behavior/Logs/rig_input.json'),'r') as f:
                         rig_output_dict = json.load(f)
-                
-                if len(tasklogic_dict['task_parameters']['environment']['block_statistics'])>1:
-                    print('multiple blocks found in session {}, handle me!!!'.format(session_dict))
-                    asdasd
-                if data_version == 'v1':
-                    #old version of data structure. -  VVVVVVVVVV
-                    reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount'] # TODO make this calibrated!!!
-                    valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['amount']*0.05 # TODO make this calibrated!!!
-                    #old version of data structure. -   AAAAAAAAAAA
-                    # # old logic here: VVVVVVVVVVVVVV
-                    loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_min'],# TODO is it true that left corresponds to loadcell 0???
-                                                tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['left_max']],
-                                            1:[tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_min'],
-                                                tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['right_max']]}
-                    loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['offset']# offset and scale is also here!!
-                    loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['force']['force_lookup_table']['scale']# offset and scale is also here!!
-                    lut_reference_name = 'ForceLut'
-                elif data_version in ['v2','v3']:
-                    reward_size = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']
-                    valve_open_time = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['reward_amount']['distribution_parameters']['value']*0.05 # TODO make this calibrated!!!
-                    try:
-                        lut_reference_name = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['lut_reference']
-                    except KeyError:
-                        lut_reference_name = 'gaussian_2d'
-                        print('No lut_reference found in tasklogic dict for session {}, using default {}'.format(session_dict,lut_reference_name))
-
-                    loadcell_limits_dict_ = {0:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_min'],# TODO is it true that left corresponds to loadcell 0???
-                                                tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action0_max']],
-                                            1:[tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_min'],
-                                                tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['action1_max']]}
-
-                    loadcell_offset = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['offset']# offset and scale is also here!!
-                    loadcell_scale = tasklogic_dict['task_parameters']['operation_control']['action_luts'][lut_reference_name]['scale']# offset and scale is also here!!
-                loadcell_limits = []
-                loadcell_limits_dict = {}
-                for pi,p in enumerate(p_to_g):
-                    if pi not in loadcell_limits_dict_.keys():
-                        print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
-                        continue
-                    loadcell_limits_dict[pi] = np.polyval(p,loadcell_limits_dict_[pi])
-                #loadcell_extent = [loadcell_limits_dict[0][0],loadcell_limits_dict[0][1],loadcell_limits_dict[1][0],loadcell_limits_dict[1][1]]
-                # 
-                
-                if data_version == 'v1':
-                    cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['upper_force_threshold'] # old logic
-                    force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['force_duration'] # old logic
-                    start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['left_harvest']['continuous_feedback']['converter_lut_output'] # old logic                
-                elif data_version in ['v2','v3']:
-                    cached_threshold = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['upper_action_threshold']['distribution_parameters']['value'] # new logic
-                    force_duration = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['action_duration']['distribution_parameters']['value'] # new logic
-                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']== None:
-                        start_end_mm = [0,0]
-                    else:
-                        start_end_mm = tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
-                distance = np.diff(start_end_mm)[0]
-                forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(lut_reference_name))
-            
-                forcemap_im =Image.open(forcemap_file)
-                forcemap_im  = np.asarray(forcemap_im,float)+loadcell_offset
-                forcemap_im = forcemap_im/cached_threshold
-                forcemap_im  = forcemap_im#*distance # TODO make sure this is in mm/s!!!
 
                 data_dict = {}
                 for file in os.listdir(os.path.join(session_dir,'behavior/SoftwareEvents/')):
@@ -347,43 +434,11 @@ def ingest_behavior_sessions(dj):
                 loadcell_2 = loadcell_data[2].values#  - offset_1
                 
                 loadcell_si = np.median(np.diff(loadcell_t))
-                
-                task_settings_dict = None
-                add_task_parts = False
-                for tsd in task_settings_dict_list:
-                    if (np.array_equal(tsd['target_force_lut'], forcemap_im) and
-                            tsd['reward_port_start_pos'] == start_end_mm[0] and
-                            tsd['reward_port_end_pos'] == start_end_mm[1] and
-                            tsd['reward_size'] == reward_size):
-                        task_settings_dict = tsd
-                        break
-                if task_settings_dict is None:
-                    task_settings_dict = {'subject_id': subject_id,
-                                          'session': session_dict['session'],
-                                          'task_setting_id': len(task_settings_dict_list),
-                                          'target_force_lut': forcemap_im,
-                                          'reward_port_start_pos': start_end_mm[0],
-                                          'reward_port_end_pos': start_end_mm[1],
-                                          'reward_size': reward_size,
-                                          }
-                    task_settings_dict_list.append(task_settings_dict)
-                    add_task_parts = True
 
-                if add_task_parts:
-                    for dim in [0,1]:
-                        task_setting_dict_part = {'subject_id':subject_id,
-                                                'session':session_dict['session'],
-                                                'task_setting_id':task_settings_dict['task_setting_id'],
-                                                'force_axis_idx': dim,
-                                                'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
-                                                'force_direction': calibration_dict[dim]['direction'],
-                                                }
-                        task_setting_dict_part_list.append(task_setting_dict_part)
-                
                 if data_version == 'v1':
 #                    threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['TrialOutcome']]# TODO - not set for v1!!
                     threshold_crossing_timestamps = reward_timestamps = [t['timestamp'] for t in data_dict['HarvestActionSelected']]
-                
+
                 elif data_version in ['v2','v3']:
                     threshold_crossing_timestamps = [t['timestamp'] for t in data_dict['IsValidTrial']]# TODO - not set for v1!!
                     reward_timestamps = [t['timestamp'] for t in data_dict['GiveReward']]
@@ -394,7 +449,7 @@ def ingest_behavior_sessions(dj):
                 if data_version == 'v1':##############TODO FIX THIS!!!
                     feedback_type = '1D_speed'
                 else:
-                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith']:
+                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith','M013','M014','M015','M016','M017','M018','M019','M020','M021','M022','M023','M024','M025','M026','M027','M028','M029','M030']:
                         feedback_type = '1D_speed'
                     else:
                         if '1d' in session_info_dict['notes'].lower():
@@ -419,14 +474,106 @@ def ingest_behavior_sessions(dj):
                         
                 go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
                 go_cue_timestamps = np.array(go_cue_timestamps)
+
+                # --- assign each trial to the block that was actually active when it started ---
+                # (v1 sessions, and any session without an ActiveBlock event, are treated as one
+                # single block using the declared block_statistics, exactly as before)
+                if data_version in ('v2', 'v3') and 'ActiveBlock' in data_dict:
+                    active_block_events = data_dict['ActiveBlock']
+                else:
+                    active_block_events = [{
+                        'timestamp': -np.inf,
+                        'data': {'trial_statistics': tasklogic_dict['task_parameters']['environment']['block_statistics'][0]},
+                    }]
+                block_start_times = np.array([be['timestamp'] for be in active_block_events])
+                all_trial_times = np.array([t['timestamp'] for t in data_dict['Trial']])
+                local_block_idx_per_trial = np.searchsorted(block_start_times, all_trial_times, side='right') - 1
+                local_block_idx_per_trial = np.clip(local_block_idx_per_trial, 0, len(active_block_events)-1)
+
+                block_first_trial_idx = len(sessiontrial_dict_list)
+                current_block = len(block_dict_list)
+                current_block_local_idx = None
+                current_block_task_setting_id = None
+                current_block_has_cue = None
+
                 trial_i = 0
                 for trial_i, t_ in enumerate(data_dict['Trial']): # go through trials#hit
+
+                    local_block_idx = local_block_idx_per_trial[trial_i]
+                    if local_block_idx != current_block_local_idx:
+                        # a new block started: close out the previous one (if any), then set this one up
+                        if current_block_local_idx is not None:
+                            _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
+                                             current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
+                            current_block = len(block_dict_list)
+                            block_first_trial_idx = len(sessiontrial_dict_list)
+                        current_block_local_idx = local_block_idx
+
+                        block_trial_statistics = active_block_events[local_block_idx]['data']['trial_statistics']
+                        block_params = _extract_block_trial_params(block_trial_statistics, data_version, tasklogic_dict, session_dict)
+                        current_block_has_cue = block_params['has_cue']
+                        valve_open_time = block_params['valve_open_time']
+
+                        loadcell_limits_dict = {}
+                        for pi,p in enumerate(p_to_g):
+                            if pi not in block_params['loadcell_limits_dict_'].keys():
+                                print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
+                                continue
+                            loadcell_limits_dict[pi] = np.polyval(p,block_params['loadcell_limits_dict_'][pi])
+
+                        distance = np.diff(block_params['start_end_mm'])[0]
+                        forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(block_params['lut_reference_name']))
+
+                        forcemap_im = Image.open(forcemap_file)
+                        forcemap_im = np.asarray(forcemap_im,float)+block_params['loadcell_offset']
+                        forcemap_im = forcemap_im/block_params['cached_threshold']
+                        forcemap_im = forcemap_im#*distance # TODO make sure this is in mm/s!!!
+
+                        # the same normalized LUT image can be reused across blocks with a different
+                        # physical axis calibration (e.g. rescaled from +-3000 to +-6000), so the axis
+                        # limits must be part of the dedup key too, not just the LUT pixels
+                        axis_limits_key = {dim: tuple(float(v) for v in loadcell_limits_dict[dim]) for dim in loadcell_limits_dict}
+
+                        task_settings_dict = None
+                        add_task_parts = False
+                        for tsd, tsd_axis_limits_key in zip(task_settings_dict_list, task_settings_axis_limits_list):
+                            if (np.array_equal(tsd['target_force_lut'], forcemap_im) and
+                                    tsd['reward_port_start_pos'] == block_params['start_end_mm'][0] and
+                                    tsd['reward_port_end_pos'] == block_params['start_end_mm'][1] and
+                                    tsd['reward_size'] == block_params['reward_size'] and
+                                    tsd_axis_limits_key == axis_limits_key):
+                                task_settings_dict = tsd
+                                break
+                        if task_settings_dict is None:
+                            task_settings_dict = {'subject_id': subject_id,
+                                                  'session': session_dict['session'],
+                                                  'task_setting_id': len(task_settings_dict_list),
+                                                  'target_force_lut': forcemap_im,
+                                                  'reward_port_start_pos': block_params['start_end_mm'][0],
+                                                  'reward_port_end_pos': block_params['start_end_mm'][1],
+                                                  'reward_size': block_params['reward_size'],
+                                                  }
+                            task_settings_dict_list.append(task_settings_dict)
+                            task_settings_axis_limits_list.append(axis_limits_key)
+                            add_task_parts = True
+
+                        if add_task_parts:
+                            for dim in [0,1]:
+                                task_setting_dict_part = {'subject_id':subject_id,
+                                                        'session':session_dict['session'],
+                                                        'task_setting_id':task_settings_dict['task_setting_id'],
+                                                        'force_axis_idx': dim,
+                                                        'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
+                                                        'force_direction': calibration_dict[dim]['direction'],
+                                                        }
+                                task_setting_dict_part_list.append(task_setting_dict_part)
+                        current_block_task_setting_id = task_settings_dict['task_setting_id']
 
                     if trial_i+trials_so_far==0:
                         session_zero_time = data_dict['Trial'][0]['timestamp']
                     trial_start_time = data_dict['Trial'][trial_i]['timestamp']
-                    
-                    if data_version == 'v1':    
+
+                    if data_version == 'v1':
                         if trial_i == len(data_dict['Trial'])-1: #use this only for the last trial
                             trial_end_time = data_dict['TrialOutcome'][-1]['timestamp']
                         else:
@@ -436,10 +583,10 @@ def ingest_behavior_sessions(dj):
                             trial_end_time = data_dict[reward_string][-1]['timestamp']
                         else:
                             trial_end_time = data_dict['Trial'][trial_i+1]['timestamp']
-                    if tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']['response_period']['has_cue']:
+                    if current_block_has_cue:
                         #go_cue_time = data_dict['ResponsePeriod'][trial_i]['timestamp']
                         go_cue_timestamps_now = go_cue_timestamps[go_cue_timestamps>trial_start_time]
-                        go_cue_timestamps_now = go_cue_timestamps_now[go_cue_timestamps_now<trial_end_time] 
+                        go_cue_timestamps_now = go_cue_timestamps_now[go_cue_timestamps_now<trial_end_time]
                     else:
                         go_cue_timestamps_now = []
                     # define if hit happened
@@ -592,16 +739,8 @@ def ingest_behavior_sessions(dj):
                     
                 if trial_i >0:
                     trials_so_far += trial_i+1 # for multiple files in a given session
-                if len(sessiontrial_dict_list) > block_first_trial_idx:
-                    block_dict_list.append({
-                        'subject_id': subject_id,
-                        'session': session_dict['session'],
-                        'block': current_block,
-                        'task_setting_id': task_settings_dict['task_setting_id'],
-                        'feedback_type': feedback_type,
-                        'block_start_time': sessiontrial_dict_list[block_first_trial_idx]['trial_start_time'],
-                        'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
-                    })
+                _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
+                                 current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
