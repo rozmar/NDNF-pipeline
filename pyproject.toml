@@ -3,7 +3,7 @@ name = "ndnf-pipeline"
 version = "0.1.0"
 description = "Shared DataJoint pipeline for the Neuronal Diversity in Network Function lab"
 readme = "README.md"
-requires-python = ">=3.11, <3.12"
+requires-python = ">=3.13, <3.14"
 dependencies = [
     "datajoint>=0.14.6",
     "google-api-python-client>=2.187.0",
