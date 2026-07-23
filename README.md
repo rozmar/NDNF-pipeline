@@ -63,7 +63,8 @@ Create a `dj_local_conf.json` file with your database credentials:
     "metadata.spreadsheet_names":["NDNF viruses plasmids",
                                   "NDNF animals",
                                   "NDNF experimenters",
-                                  "NDNF procedures"],
+                                  "NDNF procedures",
+                                  "NDNF sensor locations"],
     "path.metadata": "path-to-metadata",
     "path.google_creds_json": "path-to-credentials-json"
 }
