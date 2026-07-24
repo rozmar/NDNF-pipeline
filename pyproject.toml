@@ -3,9 +3,9 @@ name = "ndnf-pipeline"
 version = "0.1.0"
 description = "Shared DataJoint pipeline for the Neuronal Diversity in Network Function lab"
 readme = "README.md"
-requires-python = ">=3.13, <3.14"
+requires-python = ">=3.11, <3.12"
 dependencies = [
-    "datajoint>=0.14.6",
+    "datajoint==0.14.6",
     "google-api-python-client>=2.187.0",
     "graphviz>=0.21",
     "gspread>=6.2.1",
@@ -18,6 +18,7 @@ dependencies = [
     "pip>=26.1.2",
     "pydotplus>=2.0.2",
     "scipy>=1.17.1",
+    "setuptools>=80.9.0",
     "statsmodels>=0.14.6",
 ]
 

@@ -27,6 +27,7 @@ _SENSOR_RECORDING_FILENAME_RE = re.compile(r'NDNF-?_?#?(\d+)_(\d{4}-\d{2})_summa
 
 # channel prefixes as they appear in the summary CSV header, e.g. 'Temperature_avg'
 _SENSOR_CHANNELS = ['Temperature', 'Humidity', 'Light', 'Voltage', 'WIFI RSSI']
+
 def _to_float_or_none(value):
     """Convert a spreadsheet cell to float, treating blanks/'-' placeholders as None."""
     if pd.isna(value):
