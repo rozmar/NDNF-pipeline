@@ -414,12 +414,18 @@ def ingest_behavior_sessions(dj):
                         video_file_dicts.append(vf_dict)
                         video_frametimes_raw.append((vf_dict, raw_frametimes))
 
+                # per-session baseline: raw ADC value logged by the rig at zero force
+                lc_baseline_per_axis = {}
+                for entry in data_dict.get('LoadCellCalibration', []):
+                    idx = entry['data']['LoadCellIndex']
+                    if idx < len(p_to_g):
+                        lc_baseline_per_axis[idx] = entry['data']['Baseline']
+
                 for pi,p in enumerate(p_to_g):
                     loadcell_data[pi] = np.polyval(p,loadcell_data[pi])
-                # TODO : DO I NEED TO CORRECT FOR OFFSET HERE???
-                #offset_0 = np.median(loadcell_data[0].values)
-                #offset_1 = np.median(loadcell_data[1].values)
-                
+                    if pi in lc_baseline_per_axis:
+                        loadcell_data[pi] = loadcell_data[pi] - np.polyval(p, lc_baseline_per_axis[pi])
+
                 loadcell_t = loadcell_data.index.values
                 if session_date == date(2026, 5, 15):
                     # This day probably the loadcell synch was not plugged in.. ?
@@ -449,7 +455,7 @@ def ingest_behavior_sessions(dj):
                 if data_version == 'v1':##############TODO FIX THIS!!!
                     feedback_type = '1D_speed'
                 else:
-                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith','M013','M014','M015','M016','M017','M018','M019','M020','M021','M022','M023','M024','M025','M026','M027','M028','M029','M030']:
+                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith','mouse_rozmar','M013','M014','M015','M016','M017','M018','M019','M020','M021','M022','M023','M024','M025','M026','M027','M028','M029','M030']:
                         feedback_type = '1D_speed'
                     else:
                         if '1d' in session_info_dict['notes'].lower():
@@ -519,7 +525,9 @@ def ingest_behavior_sessions(dj):
                             if pi not in block_params['loadcell_limits_dict_'].keys():
                                 print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
                                 continue
-                            loadcell_limits_dict[pi] = np.polyval(p,block_params['loadcell_limits_dict_'][pi])
+                            # action_min/max are baseline-relative raw units; use slope only
+                            # (full polyval would add the intercept, shifting the axis extents)
+                            loadcell_limits_dict[pi] = p[0] * np.array(block_params['loadcell_limits_dict_'][pi])
 
                         distance = np.diff(block_params['start_end_mm'])[0]
                         forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(block_params['lut_reference_name']))
