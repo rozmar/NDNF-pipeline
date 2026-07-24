@@ -29,9 +29,9 @@ def _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, p
 
     lut = target_force_lut.copy()
     if lr_sign == -1:
-        lut = lut[:, ::-1] if lr_idx == 0 else lut[::-1, :]
+        lut = lut[::-1, :] if lr_idx == 0 else lut[:, ::-1]
     if pa_sign == -1:
-        lut = lut[:, ::-1] if pa_idx == 0 else lut[::-1, :]
+        lut = lut[::-1, :] if pa_idx == 0 else lut[:, ::-1]
     if lr_idx == 1:
         lut = lut.T
 
@@ -60,16 +60,22 @@ def _force_histogram(lr_traces, pa_traces, histrange, bins=50):
         return None, None, None
 
 
-def _fill_lut_background(ax, lut, uniform_force_range, vmin=None, vmax=None, cmap='viridis'):
-    # when the forced uniform view range is larger than the LUT's own native extent,
-    # fill the rest of the view with one of the LUT's own corner values (its background
-    # level) instead of a fixed number, so the margins don't look like blank white edges.
-    # vmin/vmax must match whatever clim the real LUT imshow uses, otherwise this fill
-    # value renders under its own independent color scaling and can look wrong (e.g. a
-    # high corner value rendering as a dark background instead of a bright one)
-    background_value = lut[0, 0]
-    ax.imshow(np.ones_like(lut) * background_value, extent=uniform_force_range,
-              cmap=cmap, vmin=vmin, vmax=vmax, alpha=1)
+def _pad_lut_to_range(lut, lut_extent, target_range):
+    """Edge-pad lut.T to cover target_range by replicating border pixels outward.
+
+    lut is [LR, PA] (dim0=LR, dim1=PA); returns a (PA+pad, LR+pad) array ready
+    for imshow with origin='lower' and extent=target_range.
+    """
+    lr_min, lr_max, pa_min, pa_max = lut_extent
+    u_lr_min, u_lr_max, u_pa_min, u_pa_max = target_range
+    n_lr, n_pa = lut.shape
+    dlr = (lr_max - lr_min) / max(n_lr - 1, 1)
+    dpa = (pa_max - pa_min) / max(n_pa - 1, 1)
+    pad_left  = max(0, int(round((lr_min  - u_lr_min) / dlr)))
+    pad_right = max(0, int(round((u_lr_max - lr_max)  / dlr)))
+    pad_bot   = max(0, int(round((pa_min  - u_pa_min) / dpa)))
+    pad_top   = max(0, int(round((u_pa_max - pa_max)  / dpa)))
+    return np.pad(lut.T, ((pad_bot, pad_top), (pad_left, pad_right)), mode='edge')
 
 
 def _plot_force_trajectories(ax, lr_traces, pa_traces, force_uniform_range=True, uniform_force_range=None,
@@ -127,8 +133,12 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
 
     lut_vmin, lut_vmax = np.min(lut), np.max(lut)
     if force_uniform_range:
-        _fill_lut_background(ax_target_LUT, lut, uniform_force_range, vmin=lut_vmin, vmax=lut_vmax)
-    ax_target_LUT.imshow(lut, extent=lut_extent, origin='lower',
+        lut_disp = _pad_lut_to_range(lut, lut_extent, uniform_force_range)
+        disp_extent = uniform_force_range
+    else:
+        lut_disp = lut.T
+        disp_extent = lut_extent
+    ax_target_LUT.imshow(lut_disp, extent=disp_extent, origin='lower',
                           cmap='viridis', aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
     ax_target_LUT.set_xlabel('Left - Right (g)')
     ax_target_LUT.set_ylabel('Posterior - Anterior (g)')
@@ -270,8 +280,12 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
     for bi, (bd, color) in enumerate(zip(block_data, block_colors)):
         ax_lut = fig.add_subplot(gs[1, bi])
         if force_uniform_range:
-            _fill_lut_background(ax_lut, bd['lut'], uniform_force_range, vmin=lut_vmin, vmax=lut_vmax)
-        im_lut = ax_lut.imshow(bd['lut'], extent=bd['lut_extent'], origin='lower', cmap='viridis',
+            lut_disp = _pad_lut_to_range(bd['lut'], bd['lut_extent'], uniform_force_range)
+            lut_disp_extent = uniform_force_range
+        else:
+            lut_disp = bd['lut'].T
+            lut_disp_extent = bd['lut_extent']
+        im_lut = ax_lut.imshow(lut_disp, extent=lut_disp_extent, origin='lower', cmap='viridis',
                                 aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
         if force_uniform_range:
             ax_lut.set_xlim(uniform_force_range[:2])
