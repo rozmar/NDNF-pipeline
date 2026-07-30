@@ -1,6 +1,7 @@
 import os
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from matplotlib.lines import Line2D
 import numpy as np
 
 DEFAULT_UNIFORM_FORCE_RANGE = np.asarray([-1, 1, -1, 1]) * 10
@@ -197,7 +198,11 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
     """Session-level overview across all of a session's blocks.
 
     Row 1: time-to-reward for every trial in the session (one panel), with each
-           block's trial range highlighted and color-coded.
+           block's trial range highlighted and color-coded. Also marks, per trial,
+           the time from threshold crossing to that trial's own end-of-trial marker
+           ('x'); note this is NOT a true inter-trial gap (see the comment where it's
+           computed below) — it's mostly a fixed hardware/task padding, except on
+           trials bordering a real pause in the session, where it spikes.
     Row 2: each block's target LUT, side by side, sharing the same axes and colormap.
     Row 3: each block's force distribution histogram, side by side, sharing the
            same axes and colormap.
@@ -217,6 +222,13 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
     n_blocks = len(available_blocks)
     session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': session}).fetch1('session_date', 'session_time')
     block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
+
+    # session-wide trial timing, used below to relate each rewarded trial's threshold-crossing
+    # time to its own end-of-trial marker
+    all_trials, all_trial_starts, all_trial_ends = (experiment.SessionTrial()
+        & {'subject_id': subject_id, 'session': session}).fetch('trial', 'trial_start_time', 'trial_end_time')
+    trial_start_by_num = dict(zip(all_trials.tolist(), np.asarray(all_trial_starts, float)))
+    trial_end_by_num = dict(zip(all_trials.tolist(), np.asarray(all_trial_ends, float)))
 
     # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax ---
     block_data = []
@@ -244,11 +256,26 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
         rewarded_trial, time_to_reward = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'trial_event_type': 'threshold crossing'}).fetch('trial', 'trial_event_time')
         block_trials = (experiment.BehaviorTrial() & key).fetch('trial')
 
+        # Time from threshold crossing to this trial's own end-of-trial marker. NOTE: at
+        # ingestion (ingest_behavior.py), a trial's end marker is stamped at the *next*
+        # trial's start timestamp, so on most trials this is really just a fixed
+        # hardware/task padding after reward, not a true behavioral gap between trials —
+        # it only spikes on trials that border a genuine pause/gap in the recording.
+        post_reward_trial, post_reward_value = [], []
+        for trial, t2r in zip(rewarded_trial, np.asarray(time_to_reward, float)):
+            trial_end = trial_end_by_num.get(int(trial))
+            if trial_end is None:
+                continue
+            post_reward_trial.append(trial)
+            post_reward_value.append(trial_end - (trial_start_by_num[int(trial)] + t2r))
+
         block_data.append(dict(block=block, lut=lut, lut_extent=lut_extent,
                                 forcehist=forcehist, binx=binx, biny=biny,
                                 lr_traces=lr_traces, pa_traces=pa_traces,
                                 rewarded_trial=rewarded_trial, time_to_reward=time_to_reward,
-                                block_trials=block_trials))
+                                block_trials=block_trials,
+                                post_reward_trial=np.array(post_reward_trial),
+                                post_reward_value=np.array(post_reward_value)))
 
     lut_vmin = min(np.min(bd['lut']) for bd in block_data)
     lut_vmax = max(np.max(bd['lut']) for bd in block_data)
@@ -269,10 +296,19 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
             ax_perf.plot(np.convolve(bd['rewarded_trial'], np.ones(10) / 10, mode='valid'),
                          np.convolve(np.asarray(bd['time_to_reward'], float), np.ones(10) / 10, mode='valid'),
                          '-', color=color)
+        if len(bd['post_reward_trial']):
+            ax_perf.plot(bd['post_reward_trial'], bd['post_reward_value'], 'x', color=color, alpha=0.7)
     ax_perf.set_xlabel('trial#')
-    ax_perf.set_ylabel('time to get reward')
+    ax_perf.set_ylabel('time (s)')
     ax_perf.set_title(f'{subject_id} s{session}  {session_date} {session_time}')
-    ax_perf.legend(loc='upper right', fontsize=8, ncol=min(max(n_blocks, 1), 6))
+    block_legend = ax_perf.legend(loc='upper right', fontsize=8, ncol=min(max(n_blocks, 1), 6))
+    ax_perf.add_artist(block_legend)
+    marker_legend_handles = [
+        Line2D([0], [0], marker='.', linestyle='None', color='black', label='time to reward'),
+        Line2D([0], [0], marker='x', linestyle='None', color='black',
+               label='threshold crossing -> trial-end marker (mostly fixed padding, not a true gap)'),
+    ]
+    ax_perf.legend(handles=marker_legend_handles, loc='upper left', fontsize=7)
 
     # --- row 2: target LUTs side by side, shared axes + colormap ---
     axes_lut = []
@@ -339,4 +375,164 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
         os.makedirs(fig_dir, exist_ok=True)
         fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_blocks_overview.png'), dpi=150)
 
+    return fig
+
+
+def plot_water_restriction_overview(lab, highlight_subject_id=None, fig_dir=None):
+    """Relative weight, water consumed, and raw weight over time for every subject on water restriction.
+
+    If highlight_subject_id is given, that subject's lines are drawn thicker.
+    If fig_dir is given, saves to '{fig_dir}/water_restriction_overview.png'.
+    Returns the figure.
+    """
+    import matplotlib.dates as mdates
+
+    mice_on_wr = lab.WaterRestriction().fetch('subject_id')
+    fig = plt.figure(figsize=(12, 8))
+    ax_weight = fig.add_subplot(3, 1, 1)
+    ax_water = fig.add_subplot(3, 1, 2, sharex=ax_weight)
+    ax_weight_real = fig.add_subplot(3, 1, 3, sharex=ax_weight)
+    for subject_id in mice_on_wr:
+        water_restriction_log = lab.WaterRestriction().WaterRestrictionLog() & {'subject_id': subject_id}
+        if len(water_restriction_log) == 0:
+            continue
+        baseline_weight = (lab.WaterRestriction() & {'subject_id': subject_id}).fetch1('wr_start_weight')
+        dates = water_restriction_log.fetch('log_datetime')
+        weights = np.asarray(water_restriction_log.fetch('weight'), float)
+        weights_after = np.asarray(water_restriction_log.fetch('weight_after_watering'), float)
+        water_consumed = weights_after - weights
+        relative_weights = weights / float(baseline_weight) * 100
+        linewidth = 2.5 if subject_id == highlight_subject_id else 1
+        ax_weight.plot(dates, relative_weights, 'o-', label=subject_id, linewidth=linewidth)
+        ax_water.plot(dates, water_consumed, 'o-', label=subject_id, linewidth=linewidth)
+        ax_weight_real.plot(dates, weights, 'o-', label=subject_id, linewidth=linewidth)
+
+    ax_weight.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax_weight.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    for label in ax_weight_real.get_xticklabels():
+        label.set_rotation(45)
+        label.set_ha('right')
+    ax_weight.set_ylabel('Relative weight (%)')
+    ax_water.set_ylabel('Water consumed (ml)')
+    ax_weight_real.set_ylabel('Weight (g)')
+    ax_weight_real.set_xlabel('date')
+    ax_weight.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    fig.tight_layout()
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, 'water_restriction_overview.png'), dpi=150)
+    return fig
+
+
+def plot_trials_per_mouse(lab, experiment, subject_ids=None, fig_dir=None):
+    """Bar chart of total trial count per subject that has run at least one trial.
+
+    If subject_ids is given, only those subjects are shown (still restricted to ones
+    with at least one trial); otherwise every subject with trials is shown.
+    If fig_dir is given, saves to '{fig_dir}/trials_per_mouse.png'.
+    Returns the figure.
+    """
+    mouse_ids = np.sort(lab.Subject.fetch('subject_id'))
+    trial_nums = np.array([len(experiment.SessionTrial() & {'subject_id': m}) for m in mouse_ids])
+    keep = trial_nums > 0
+    if subject_ids:
+        keep = keep & np.isin(mouse_ids, list(subject_ids))
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.bar(mouse_ids[keep], trial_nums[keep])
+    for label in ax.get_xticklabels():
+        label.set_rotation(45)
+        label.set_ha('right')
+    ax.set_xlabel('Mouse ID')
+    ax.set_ylabel('Number of Trials')
+    fig.tight_layout()
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, 'trials_per_mouse.png'), dpi=150)
+    return fig
+
+
+def _fetch_session_trend(experiment, subject_id):
+    """Per-session (trial count, session length, hit rate) arrays for one subject, sorted by session."""
+    available_sessions = np.sort((experiment.Session() & {'subject_id': subject_id}).fetch('session'))
+    trial_nums, hit_rates, session_lengths = [], [], []
+    for session in available_sessions:
+        trials = (experiment.SessionTrial() & {'subject_id': subject_id, 'session': session}).fetch('trial')
+        trial_nums.append(len(trials))
+        hits = len(experiment.BehaviorTrial() & {'subject_id': subject_id, 'session': session, 'outcome': 'hit'})
+        hit_rates.append(hits / len(trials) if len(trials) > 0 else np.nan)
+        if len(trials) > 0:
+            session_length = (experiment.SessionTrial() & {'subject_id': subject_id, 'session': session,
+                                                             'trial': int(np.max(trials))}).fetch1('trial_end_time')
+        else:
+            session_length = np.nan
+        session_lengths.append(session_length)
+    return available_sessions, np.array(trial_nums), np.array(session_lengths, dtype=float), np.array(hit_rates, dtype=float)
+
+
+def plot_subject_behavior_trend(experiment, subject_id, fig_dir=None):
+    """Per-session trial count, session length, and hit rate for one subject, across all its sessions.
+
+    If fig_dir is given, saves to '{fig_dir}/{subject_id}_behavior_trend.png'.
+    Returns the figure.
+    """
+    available_sessions, trial_nums, session_lengths, hit_rates = _fetch_session_trend(experiment, subject_id)
+
+    fig = plt.figure(figsize=(8, 8))
+    ax1 = fig.add_subplot(3, 1, 1)
+    ax1.plot(available_sessions, trial_nums, 'o-')
+    ax1.set_ylabel('number of trials')
+    ax1.set_title(f'{subject_id} behavior overview')
+    ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
+    ax2.plot(available_sessions, session_lengths, 'o-')
+    ax2.set_ylabel('session length (s)')
+    ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+    ax3.plot(available_sessions, hit_rates, 'o-')
+    ax3.set_ylabel('hit rate')
+    ax3.set_xlabel('session')
+    fig.tight_layout()
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, f'{subject_id}_behavior_trend.png'), dpi=150)
+    return fig
+
+
+def plot_subject_behavior_trends(experiment, subject_ids, fig_dir=None):
+    """Per-session trial count, session length, and hit rate for multiple subjects, overlaid.
+
+    Each subject gets its own color and a legend entry. If subject_ids is empty, returns
+    an empty placeholder figure (nothing to fetch/plot).
+    If fig_dir is given, saves to '{fig_dir}/subject_behavior_trends.png'.
+    Returns the figure.
+    """
+    fig = plt.figure(figsize=(8, 8))
+    ax1 = fig.add_subplot(3, 1, 1)
+    ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
+    ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+
+    if subject_ids:
+        colors = plt.cm.tab10(np.arange(len(subject_ids)) % 10)
+        for subject_id, color in zip(subject_ids, colors):
+            sessions, trial_nums, session_lengths, hit_rates = _fetch_session_trend(experiment, subject_id)
+            ax1.plot(sessions, trial_nums, 'o-', color=color, label=subject_id)
+            ax2.plot(sessions, session_lengths, 'o-', color=color)
+            ax3.plot(sessions, hit_rates, 'o-', color=color)
+        ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+    else:
+        ax2.text(0.5, 0.5, 'Select one or more mice to show session trends',
+                  ha='center', va='center', transform=ax2.transAxes, color='gray')
+
+    ax1.set_ylabel('number of trials')
+    ax2.set_ylabel('session length (s)')
+    ax3.set_ylabel('hit rate')
+    ax3.set_xlabel('session')
+    fig.tight_layout()
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, 'subject_behavior_trends.png'), dpi=150)
     return fig
