@@ -6,7 +6,9 @@ then lets you pick a subject and session and view plots for it across tabs.
 
 Run with:  python GUIs/behavior_gui.py
 """
+import queue
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")  # figures are built headless, then re-parented into a Tk canvas below
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.widgets import RectangleSelector
 import numpy as np
 
 GUIS_DIR = Path(__file__).resolve().parent
@@ -54,6 +57,38 @@ class UniformRangeControl(ttk.Frame):
             value = 20.0
             self.value_var.set(str(value))
         return np.asarray([-1, 1, -1, 1]) * value
+
+
+class PerfAxisControls(ttk.Frame):
+    """Log/linear Y-axis toggle + rolling-mean window size, for a quiescence/response panel."""
+
+    def __init__(self, master, on_change, default_window=10):
+        super().__init__(master)
+        self.on_change = on_change
+        self.log_yscale = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self, text="Log Y axis", variable=self.log_yscale,
+                         command=self.on_change).pack(side="left")
+        ttk.Label(self, text="Rolling mean window:").pack(side="left", padx=(10, 0))
+        self.smoothing_window = tk.StringVar(value=str(default_window))
+        entry = ttk.Entry(self, textvariable=self.smoothing_window, width=4)
+        entry.pack(side="left", padx=(2, 0))
+        entry.bind("<Return>", lambda e: self.on_change())
+        entry.bind("<FocusOut>", lambda e: self.on_change())
+        self._default_window = default_window
+
+    @property
+    def log_scale(self):
+        return self.log_yscale.get()
+
+    def get_smoothing_window(self):
+        try:
+            window = int(self.smoothing_window.get())
+            if window < 1:
+                raise ValueError
+        except ValueError:
+            window = self._default_window
+            self.smoothing_window.set(str(window))
+        return window
 
 
 class PlotPanel(ttk.Frame):
@@ -104,6 +139,8 @@ class SessionOverviewTab(ttk.Frame):
                          command=self.refresh).pack(side="left")
         self.range_control = UniformRangeControl(controls, on_change=self.refresh)
         self.range_control.pack(side="left", padx=(10, 0))
+        self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
+        self.perf_controls.pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
         self.panel = PlotPanel(self)
         self.panel.pack(fill="both", expand=True)
@@ -123,13 +160,20 @@ class SessionOverviewTab(ttk.Frame):
                 subject_id, session,
                 subtract_force_median=self.subtract_median.get(),
                 force_uniform_range=self.range_control.enabled,
-                uniform_force_range=self.range_control.get_range())
+                uniform_force_range=self.range_control.get_range(),
+                perf_log_yscale=self.perf_controls.log_scale,
+                perf_smoothing_window=self.perf_controls.get_smoothing_window())
 
         self.app.run_plot(work, self.panel)
 
 
 class BlockDetailTab(ttk.Frame):
-    """4-panel detail figure for a single block of the selected session."""
+    """4-panel detail figure for a single block of the selected session.
+
+    A trial multi-select restricts which trials feed the force-distribution and
+    trajectory panels; the performance (quiescence/response) panel always shows every
+    trial in the block regardless of that selection.
+    """
 
     def __init__(self, master, app):
         super().__init__(master)
@@ -140,21 +184,45 @@ class BlockDetailTab(ttk.Frame):
         self.block_var = tk.StringVar()
         self.block_cb = ttk.Combobox(controls, textvariable=self.block_var, state="readonly", width=8)
         self.block_cb.pack(side="left", padx=(4, 10))
-        self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.on_block_selected())
         self.subtract_median = tk.BooleanVar(value=True)
         ttk.Checkbutton(controls, text="Subtract force median", variable=self.subtract_median,
                          command=self.refresh).pack(side="left")
         self.range_control = UniformRangeControl(controls, on_change=self.refresh)
         self.range_control.pack(side="left", padx=(10, 0))
+        self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
+        self.perf_controls.pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
-        self.panel = PlotPanel(self)
-        self.panel.pack(fill="both", expand=True)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y", padx=(5, 0), pady=5)
+        ttk.Label(left, text="Trials for 2D hist\n& trajectories\n(none = all):", justify="left").pack(anchor="w")
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill="y", expand=True)
+        self.trial_listbox = tk.Listbox(list_frame, selectmode="extended", exportselection=False,
+                                         width=8, height=22)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.trial_listbox.yview)
+        self.trial_listbox.configure(yscrollcommand=scrollbar.set)
+        self.trial_listbox.pack(side="left", fill="y")
+        scrollbar.pack(side="left", fill="y")
+        self.trial_listbox.bind("<<ListboxSelect>>", lambda e: self.refresh())
+        button_row = ttk.Frame(left)
+        button_row.pack(fill="x", pady=(5, 0))
+        ttk.Button(button_row, text="All", command=self.select_all_trials).pack(side="left")
+        ttk.Button(button_row, text="None", command=self.select_no_trials).pack(side="left", padx=(4, 0))
+
+        self.panel = PlotPanel(body)
+        self.panel.pack(side="left", fill="both", expand=True)
 
     def on_session_changed(self):
         subject_id, session = self.app.get_selected_subject_session()
         self.block_cb["values"] = []
         self.block_var.set("")
         if subject_id is None or session is None:
+            self.trial_listbox.delete(0, "end")
             self.panel.clear()
             return
         try:
@@ -167,9 +235,40 @@ class BlockDetailTab(ttk.Frame):
         self.block_cb["values"] = values
         if values:
             self.block_var.set(values[0])
-            self.refresh()
+            self.on_block_selected()
         else:
+            self.trial_listbox.delete(0, "end")
             self.panel.clear()
+
+    def on_block_selected(self):
+        self.reload_trials()
+        self.refresh()
+
+    def reload_trials(self):
+        subject_id, session = self.app.get_selected_subject_session()
+        block_str = self.block_var.get()
+        self.trial_listbox.delete(0, "end")
+        if subject_id is None or session is None or not block_str:
+            return
+        key = {"subject_id": subject_id, "session": session, "block": int(block_str)}
+        try:
+            trials = sorted((self.app.experiment.BehaviorTrial() & key).fetch("trial").tolist())
+        except Exception as exc:
+            self.app.report_error(exc)
+            return
+        for t in trials:
+            self.trial_listbox.insert("end", t)
+
+    def select_all_trials(self):
+        self.trial_listbox.selection_set(0, "end")
+        self.refresh()
+
+    def select_no_trials(self):
+        self.trial_listbox.selection_clear(0, "end")
+        self.refresh()
+
+    def get_selected_trials(self):
+        return [int(self.trial_listbox.get(i)) for i in self.trial_listbox.curselection()]
 
     def refresh(self):
         subject_id, session = self.app.get_selected_subject_session()
@@ -177,6 +276,7 @@ class BlockDetailTab(ttk.Frame):
         if subject_id is None or session is None or not block_str:
             return
         block = int(block_str)
+        selected_trials = self.get_selected_trials()
         from ndnf_pipeline.plot.behavior_plots import plot_block_force_figure
 
         def work():
@@ -184,7 +284,10 @@ class BlockDetailTab(ttk.Frame):
                 subject_id, session, block,
                 subtract_force_median=self.subtract_median.get(),
                 force_uniform_range=self.range_control.enabled,
-                uniform_force_range=self.range_control.get_range())
+                uniform_force_range=self.range_control.get_range(),
+                perf_log_yscale=self.perf_controls.log_scale,
+                perf_smoothing_window=self.perf_controls.get_smoothing_window(),
+                trials=selected_trials or None)
 
         self.app.run_plot(work, self.panel)
 
@@ -331,6 +434,342 @@ class WaterRestrictionTab(ttk.Frame):
         self.app.run_plot(work, self.panel)
 
 
+class VideoGenerationTab(ttk.Frame):
+    """Generate an annotated trial-range video for one block, with an interactive crop tool.
+
+    The block and trial range are inherited from the Block Detail tab (its block dropdown and
+    its trial multi-select — "none selected" there means "every trial in the block") rather than
+    picked here, so the video always matches whatever block/trials you're already looking at.
+
+    Wraps ndnf_pipeline.plot.videography_plots (load_trial_video_data / preview_last_frame /
+    render_trial_video) — see that module for what each rendering parameter controls.
+    """
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self._crop = (0, 0, 0, 0)
+        self._crop_frame_shape = None
+        self._crop_selector = None
+        self._preview_clims = None
+        self._output_path = None
+        self._render_queue = queue.Queue()
+        self._inherited_block = None
+        self._inherited_trial_start = None
+        self._inherited_trial_end = None
+
+        selectors = ttk.Frame(self)
+        selectors.pack(fill="x", padx=5, pady=(5, 0))
+        ttk.Label(selectors, text="From Block Detail tab:").pack(side="left")
+        self.inherited_label_var = tk.StringVar(value="(switch to the Block Detail tab and pick a block first)")
+        ttk.Label(selectors, textvariable=self.inherited_label_var, foreground="gray").pack(side="left", padx=(4, 10))
+        ttk.Button(selectors, text="Refresh from Block Detail", command=self.sync_from_block_detail).pack(side="left")
+
+        ttk.Label(selectors, text="Camera:").pack(side="left", padx=(16, 0))
+        self.camera_var = tk.StringVar()
+        self.camera_cb = ttk.Combobox(selectors, textvariable=self.camera_var, state="readonly", width=14)
+        self.camera_cb.pack(side="left", padx=(4, 10))
+
+        params = ttk.Frame(self)
+        params.pack(fill="x", padx=5, pady=(4, 0))
+        self.pad_start_var = tk.StringVar(value="1.0")
+        self.pad_end_var = tk.StringVar(value="1.0")
+        self.tail_var = tk.StringVar(value="5")
+        self.force_limit_var = tk.StringVar(value="10.0")
+        self.clim_low_var = tk.StringVar(value="0")
+        self.clim_high_var = tk.StringVar(value="95")
+        self.speed_var = tk.StringVar(value="1.0")
+        self.fps_var = tk.StringVar(value="20")
+        self.lang_var = tk.StringVar(value="en")
+
+        def _labeled_entry(parent, label, var, width=5):
+            ttk.Label(parent, text=label).pack(side="left")
+            ttk.Entry(parent, textvariable=var, width=width).pack(side="left", padx=(2, 10))
+
+        _labeled_entry(params, "pad start (s):", self.pad_start_var)
+        _labeled_entry(params, "pad end (s):", self.pad_end_var)
+        _labeled_entry(params, "tail (s):", self.tail_var)
+        _labeled_entry(params, "force limit (g):", self.force_limit_var)
+        _labeled_entry(params, "clim low%:", self.clim_low_var, width=4)
+        _labeled_entry(params, "high%:", self.clim_high_var, width=4)
+        _labeled_entry(params, "speed:", self.speed_var, width=4)
+        _labeled_entry(params, "fps:", self.fps_var, width=4)
+        ttk.Label(params, text="lang:").pack(side="left")
+        ttk.Combobox(params, textvariable=self.lang_var, state="readonly", width=4,
+                     values=["en", "hu"]).pack(side="left", padx=(2, 0))
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", padx=5, pady=(4, 4))
+        ttk.Button(actions, text="Load frame for cropping", command=self.load_frame_for_cropping).pack(side="left")
+        ttk.Button(actions, text="Apply crop from selection", command=self.apply_crop).pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="Reset crop", command=self.reset_crop).pack(side="left", padx=(6, 0))
+        self.crop_label_var = tk.StringVar(value="crop: left=0 right=0 top=0 bottom=0")
+        ttk.Label(actions, textvariable=self.crop_label_var).pack(side="left", padx=(10, 0))
+
+        actions2 = ttk.Frame(self)
+        actions2.pack(fill="x", padx=5, pady=(0, 4))
+        ttk.Button(actions2, text="Preview", command=self.do_preview).pack(side="left")
+        ttk.Button(actions2, text="Choose output file...", command=self.choose_output_path).pack(side="left", padx=(6, 0))
+        self.output_label_var = tk.StringVar(value="(no output file chosen)")
+        ttk.Label(actions2, textvariable=self.output_label_var, foreground="gray").pack(side="left", padx=(6, 0))
+        self.render_button = ttk.Button(actions2, text="Render video", command=self.start_render)
+        self.render_button.pack(side="left", padx=(10, 0))
+        self.render_progress = ttk.Progressbar(actions2, mode="indeterminate", length=120)
+        self.render_progress.pack(side="left", padx=(10, 0))
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        crop_frame = ttk.LabelFrame(body, text="Crop selection (drag the box edges)")
+        crop_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        self.crop_panel = PlotPanel(crop_frame)
+        self.crop_panel.pack(fill="both", expand=True)
+        preview_frame = ttk.LabelFrame(body, text="Preview (last frame)")
+        preview_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self.preview_panel = PlotPanel(preview_frame)
+        self.preview_panel.pack(fill="both", expand=True)
+
+    # --- inherit block/trials from the Block Detail tab ---
+    def on_session_changed(self):
+        self.reload_cameras()
+        self.sync_from_block_detail()
+
+    def reload_cameras(self):
+        subject_id, session = self.app.get_selected_subject_session()
+        self.camera_cb["values"] = []
+        self.camera_var.set("")
+        if subject_id is None or session is None:
+            return
+        try:
+            from ndnf_pipeline import videography
+            cameras = sorted(set((videography.VideoRecording()
+                                   & {"subject_id": subject_id, "session": session}).fetch("device").tolist()))
+        except Exception as exc:
+            self.app.report_error(exc)
+            return
+        self.camera_cb["values"] = cameras
+        if cameras:
+            self.camera_var.set(cameras[0])
+
+    def sync_from_block_detail(self):
+        """Re-read the Block Detail tab's block + trial selection (none selected there = every
+        trial in the block) and convert it into the block-relative trial_start/trial_end indices
+        load_trial_video_data expects."""
+        self._inherited_block = None
+        self._inherited_trial_start = None
+        self._inherited_trial_end = None
+        subject_id, session = self.app.get_selected_subject_session()
+        block_str = self.app.block_detail_tab.block_var.get()
+        if subject_id is None or session is None or not block_str:
+            self.inherited_label_var.set("(switch to the Block Detail tab and pick a block first)")
+            return
+        try:
+            all_trials = sorted((self.app.experiment.BehaviorTrial()
+                                  & {"subject_id": subject_id, "session": session, "block": int(block_str)}
+                                  ).fetch("trial").tolist())
+        except Exception as exc:
+            self.app.report_error(exc)
+            return
+        if not all_trials:
+            self.inherited_label_var.set(f"Block {block_str}: no trials in this block")
+            return
+        selected = self.app.block_detail_tab.get_selected_trials()
+        chosen = sorted(t for t in selected if t in all_trials) if selected else all_trials
+        if not chosen:
+            self.inherited_label_var.set(f"Block {block_str}: the selected trials aren't in this block")
+            return
+        self._inherited_block = int(block_str)
+        self._inherited_trial_start = all_trials.index(min(chosen))
+        self._inherited_trial_end = all_trials.index(max(chosen))
+        if selected:
+            self.inherited_label_var.set(f"Block {block_str}: trials {min(chosen)}-{max(chosen)} "
+                                          f"({len(chosen)} of {len(all_trials)} selected)")
+        else:
+            self.inherited_label_var.set(f"Block {block_str}: all {len(all_trials)} trials "
+                                          f"(trial numbers {all_trials[0]}-{all_trials[-1]})")
+
+    # --- widget value parsing ---
+    def _read_float(self, var, default):
+        try:
+            return float(var.get())
+        except ValueError:
+            var.set(str(default))
+            return default
+
+    def _read_int(self, var, default):
+        try:
+            return int(var.get())
+        except ValueError:
+            var.set(str(default))
+            return default
+
+    def _current_params(self):
+        """Read + validate the inherited block/trial-range plus the camera selection. Returns
+        load_trial_video_data kwargs, or None (after reporting the problem) if something
+        required is missing/invalid."""
+        subject_id, session = self.app.get_selected_subject_session()
+        camera = self.camera_var.get()
+        if subject_id is None or session is None:
+            self.app.report_error(RuntimeError("Select a subject and session first."))
+            return None
+        if self._inherited_block is None:
+            self.app.report_error(RuntimeError(
+                "Pick a block (and, optionally, trials) on the Block Detail tab first, "
+                "then click 'Refresh from Block Detail'."))
+            return None
+        if not camera:
+            self.app.report_error(RuntimeError("No camera recordings available for this session."))
+            return None
+        return dict(subject_id=subject_id, session=session, block=self._inherited_block,
+                    trial_start=self._inherited_trial_start, trial_end=self._inherited_trial_end,
+                    camera_name=camera,
+                    pad_start=self._read_float(self.pad_start_var, 1.0),
+                    pad_end=self._read_float(self.pad_end_var, 1.0))
+
+    def _render_kwargs(self):
+        return dict(
+            clim_pct=(self._read_float(self.clim_low_var, 0), self._read_float(self.clim_high_var, 95)),
+            tail_s=self._read_float(self.tail_var, 5),
+            force_axis_limit=self._read_float(self.force_limit_var, 10.0),
+            lang=self.lang_var.get() or "en",
+        )
+
+    # --- actions ---
+    def load_frame_for_cropping(self):
+        params = self._current_params()
+        if params is None:
+            return
+        self.app.status_var.set("Loading frame...")
+        self.app.update_idletasks()
+        try:
+            from ndnf_pipeline.plot.videography_plots import load_trial_video_data, preview_last_frame, _prepare_frame
+            data = load_trial_video_data(**params)
+            render_kwargs = self._render_kwargs()
+            dashboard_fig, last_frame, clims = preview_last_frame(data, crop=(0, 0, 0, 0),
+                                                                    clim_pct=render_kwargs["clim_pct"])
+            plt.close(dashboard_fig)
+            rgb = _prepare_frame(last_frame, (0, 0, 0, 0), clims)
+            h, w = last_frame.shape[:2]
+            fig, ax = plt.subplots(figsize=(7, max(4.0, 7 * h / w)))
+            ax.imshow(rgb)
+            ax.set_title("Drag the box edges/corners to set the crop, then click 'Apply crop'", fontsize=9)
+            left, right, top, bottom = self._crop
+            selector = RectangleSelector(ax, onselect=lambda *a: None, useblit=False, interactive=True,
+                                          button=[1], minspanx=5, minspany=5, spancoords="pixels",
+                                          drag_from_anywhere=True)
+            selector.extents = (left, max(w - right, left + 1), top, max(h - bottom, top + 1))
+            self._crop_selector = selector
+            self._crop_frame_shape = (h, w)
+            self.crop_panel.show_figure(fig)
+            self.app.status_var.set("Frame loaded - adjust the crop box, then click 'Apply crop'.")
+        except Exception as exc:
+            self.app.report_error(exc)
+            self.app.status_var.set("Failed to load frame - see error dialog.")
+
+    def apply_crop(self):
+        if self._crop_selector is None or self._crop_frame_shape is None:
+            self.app.report_error(RuntimeError("Load a frame for cropping first."))
+            return
+        xmin, xmax, ymin, ymax = self._crop_selector.extents
+        h, w = self._crop_frame_shape
+        left = int(round(max(0, xmin)))
+        right = int(round(max(0, w - xmax)))
+        top = int(round(max(0, ymin)))
+        bottom = int(round(max(0, h - ymax)))
+        self._crop = (left, right, top, bottom)
+        self.crop_label_var.set(f"crop: left={left} right={right} top={top} bottom={bottom}")
+
+    def reset_crop(self):
+        self._crop = (0, 0, 0, 0)
+        self.crop_label_var.set("crop: left=0 right=0 top=0 bottom=0")
+        if self._crop_selector is not None and self._crop_frame_shape is not None:
+            h, w = self._crop_frame_shape
+            self._crop_selector.extents = (0, w, 0, h)
+
+    def do_preview(self):
+        params = self._current_params()
+        if params is None:
+            return
+        self.app.status_var.set("Building preview...")
+        self.app.update_idletasks()
+        try:
+            from ndnf_pipeline.plot.videography_plots import load_trial_video_data, preview_last_frame
+            data = load_trial_video_data(**params)
+            render_kwargs = self._render_kwargs()
+            fig, last_frame, clims = preview_last_frame(data, crop=self._crop, **render_kwargs)
+            self._preview_clims = clims
+            self.preview_panel.show_figure(fig)
+            self.app.status_var.set("Preview ready.")
+        except Exception as exc:
+            self.app.report_error(exc)
+            self.app.status_var.set("Preview failed - see error dialog.")
+
+    def choose_output_path(self):
+        subject_id, session = self.app.get_selected_subject_session()
+        block_str = self.block_var.get()
+        camera = self.camera_var.get()
+        default_name = "video.mp4"
+        if subject_id and session is not None and block_str and camera:
+            default_name = (f"{subject_id}_s{session}_b{block_str}_"
+                             f"t{self.trial_start_var.get()}-{self.trial_end_var.get()}_{camera}.mp4")
+        cfg = dj_connection.load_gui_config()
+        initial_dir = cfg.get("video_output_dir") or str(Path.home())
+        path = filedialog.asksaveasfilename(
+            title="Save video as", defaultextension=".mp4", initialfile=default_name,
+            initialdir=initial_dir, filetypes=[("MP4 video", "*.mp4"), ("All files", "*.*")])
+        if not path:
+            return
+        self._output_path = path
+        self.output_label_var.set(path)
+        cfg["video_output_dir"] = str(Path(path).parent)
+        dj_connection.save_gui_config(cfg)
+
+    def start_render(self):
+        if self._output_path is None:
+            self.app.report_error(RuntimeError("Choose an output file first."))
+            return
+        params = self._current_params()
+        if params is None:
+            return
+        render_kwargs = self._render_kwargs()
+        speed = self._read_float(self.speed_var, 1.0)
+        fps = self._read_int(self.fps_var, 20)
+        crop = self._crop
+        clims = self._preview_clims
+        output_path = self._output_path
+
+        self.render_button.config(state="disabled")
+        self.render_progress.start(50)
+        self.app.status_var.set("Rendering video... this can take a while.")
+
+        def work():
+            try:
+                from ndnf_pipeline.plot.videography_plots import load_trial_video_data, render_trial_video
+                data = load_trial_video_data(**params)
+                render_trial_video(data, output_path, video_fps=fps, playback_speed=speed,
+                                    crop=crop, clims=clims, **render_kwargs)
+                self._render_queue.put(("done", output_path))
+            except Exception as exc:
+                self._render_queue.put(("error", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(200, self._poll_render_queue)
+
+    def _poll_render_queue(self):
+        try:
+            status, payload = self._render_queue.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll_render_queue)
+            return
+        self.render_progress.stop()
+        self.render_button.config(state="normal")
+        if status == "done":
+            self.app.status_var.set(f"Video saved: {payload}")
+            messagebox.showinfo("Video saved", f"Saved to:\n{payload}")
+        else:
+            self.app.status_var.set("Render failed - see error dialog.")
+            self.app.report_error(payload)
+
+
 class BehaviorGUI(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -382,13 +821,15 @@ class BehaviorGUI(tk.Tk):
         self.subject_trend_tab = SubjectTrendTab(self.notebook, self)
         self.trials_per_mouse_tab = TrialsPerMouseTab(self.notebook, self)
         self.water_restriction_tab = WaterRestrictionTab(self.notebook, self)
+        self.video_generation_tab = VideoGenerationTab(self.notebook, self)
         self.notebook.add(self.session_overview_tab, text="Session Overview")
         self.notebook.add(self.block_detail_tab, text="Block Detail")
         self.notebook.add(self.subject_trend_tab, text="Subject Trend")
         self.notebook.add(self.trials_per_mouse_tab, text="Trials per Mouse")
         self.notebook.add(self.water_restriction_tab, text="Water Restriction")
+        self.notebook.add(self.video_generation_tab, text="Generate Video")
         self._tabs = (self.session_overview_tab, self.block_detail_tab, self.subject_trend_tab,
-                       self.trials_per_mouse_tab, self.water_restriction_tab)
+                       self.trials_per_mouse_tab, self.water_restriction_tab, self.video_generation_tab)
 
     def _build_status_bar(self):
         self.status_var = tk.StringVar(value="Not connected.")
@@ -446,9 +887,20 @@ class BehaviorGUI(tk.Tk):
             return
         self.subject_cb["values"] = subject_ids
         if subject_ids and self.subject_var.get() not in subject_ids:
-            self.subject_var.set(subject_ids[0])
+            self.subject_var.set(self._most_recent_subject(subject_ids))
         if subject_ids:
             self.on_subject_selected()
+
+    def _most_recent_subject(self, subject_ids):
+        """Subject with the most recent session, falling back to the first subject alphabetically."""
+        try:
+            subs, dates, times = self.experiment.Session().fetch('subject_id', 'session_date', 'session_time')
+        except Exception:
+            subs = []
+        if len(subs):
+            latest_idx = max(range(len(subs)), key=lambda i: (dates[i], times[i]))
+            return subs[latest_idx]
+        return subject_ids[0]
 
     def on_subject_selected(self):
         self.populate_sessions()
