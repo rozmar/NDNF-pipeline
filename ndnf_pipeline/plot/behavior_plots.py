@@ -253,10 +253,7 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     ax_traj = fig.add_subplot(gs[1, 1])
     _plot_force_trajectories(ax_traj, lr_traces, pa_traces, force_uniform_range, uniform_force_range)
 
-    # --- bottom row: the same (baseline-corrected, axis-remapped) LR/PA traces used above,
-    # plotted against absolute session time instead of space, one line per trial so gaps
-    # between non-adjacent/unselected trials aren't bridged by a spurious connecting line ---
-    ax_force_time = fig.add_subplot(gs[2, :])
+    # --- shared per-trial timing, used by both the lickport and force-vs-time panels below ---
     time_query = (experiment.TrialForceTrace() * experiment.BehaviorTrial() * experiment.Block()
                   * experiment.SessionTrial() & key)
     if trials:
@@ -265,6 +262,8 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
         'trial', 'trial_start_time', 'trial_end_time', 'force_trace_time', order_by='trial')
     if not np.array_equal(time_trials, force_trials):
         raise RuntimeError('trial mismatch between TrialForceTrace and TrialForceTrace.TrialForceAxis fetches')
+    trial_start_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_starts, float)))
+    trial_end_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_ends, float)))
 
     # period boundaries, fetched for the whole block (not just the plotted trials) and looked
     # up per trial below; 'go' marks the end of quiescence/start of response, 'reward' (falling
@@ -278,22 +277,66 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     threshold_by_trial = _event_time_by_trial('threshold crossing')
     reward_by_trial = _event_time_by_trial('reward')
 
-    for trial, trial_start, trial_end, f_time, lr, pa in zip(
-            time_trials, np.asarray(trial_starts, float), np.asarray(trial_ends, float), force_times, lr_traces, pa_traces):
-        trial = int(trial)
+    def _shade_trial_periods(ax, trial, trial_start, trial_end):
         go_t = go_by_trial.get(trial)
         threshold_t = threshold_by_trial.get(trial)
         reward_t = reward_by_trial.get(trial)
         if go_t is not None:
             quiescence_end = trial_start + go_t
             response_end = trial_start + threshold_t if threshold_t is not None else trial_end
-            ax_force_time.axvspan(trial_start, quiescence_end, color='gray', alpha=0.15, linewidth=0)
-            ax_force_time.axvspan(quiescence_end, response_end, color='gold', alpha=0.15, linewidth=0)
+            ax.axvspan(trial_start, quiescence_end, color='gray', alpha=0.15, linewidth=0)
+            ax.axvspan(quiescence_end, response_end, color='gold', alpha=0.15, linewidth=0)
         reward_time_abs = trial_start + reward_t if reward_t is not None else (
             trial_start + threshold_t if threshold_t is not None else None)
         if reward_time_abs is not None:
-            ax_force_time.axvline(reward_time_abs, color='green', linewidth=1.2, alpha=0.8)
+            ax.axvline(reward_time_abs, color='green', linewidth=1.2, alpha=0.8)
 
+    # --- lickport position vs. time, shares its x axis with the force-vs-time panel below ---
+    ax_force_time = fig.add_subplot(gs[3, :])
+    ax_lickport = fig.add_subplot(gs[2, :], sharex=ax_force_time)
+    lickport_query = (experiment.TrialRewardPortPosition() * experiment.BehaviorTrial() * experiment.Block()
+                       * experiment.SessionTrial() & key)
+    if trials:
+        lickport_query = lickport_query & trial_restriction
+    lp_trials, lp_trial_starts, lp_times, lp_values = lickport_query.fetch(
+        'trial', 'trial_start_time', 'reward_port_position_time', 'reward_port_position_values', order_by='trial')
+    for trial, trial_start, lp_time, lp_val in zip(lp_trials, np.asarray(lp_trial_starts, float), lp_times, lp_values):
+        trial = int(trial)
+        trial_end = trial_end_by_num.get(trial, trial_start)
+        _shade_trial_periods(ax_lickport, trial, trial_start, trial_end)
+        lp_time_arr = np.asarray(lp_time, float)
+        lp_val_arr = np.asarray(lp_val, float)
+        if len(lp_time_arr) == 0:
+            continue
+        # the port is only logged when it moves, so hold each value forward (step, not linear
+        # interpolation) until the next logged sample, and extend the first/last known value
+        # out to the trial's own start/end so the trace covers the full trial with no gaps
+        ext_time_abs = np.concatenate([[trial_start], trial_start + lp_time_arr, [trial_end]])
+        ext_val = np.concatenate([[lp_val_arr[0]], lp_val_arr, [lp_val_arr[-1]]])
+        ax_lickport.step(ext_time_abs, ext_val, where='post', color='tab:purple', linewidth=0.8, alpha=0.8)
+
+    lick_query = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
+                  & {**key, 'trial_event_type': 'lick'})
+    if trials:
+        lick_query = lick_query & trial_restriction
+    lick_trials_raw, lick_times_raw = lick_query.fetch('trial', 'trial_event_time')
+    lick_abs_times = [trial_start_by_num[int(t)] + float(lt) for t, lt in zip(lick_trials_raw, lick_times_raw)
+                       if int(t) in trial_start_by_num]
+    if lick_abs_times:
+        y0, y1 = ax_lickport.get_ylim()
+        tick_height = 0.08 * (y1 - y0)
+        ax_lickport.eventplot(lick_abs_times, orientation='horizontal', lineoffsets=y1 - tick_height / 2,
+                               linelengths=tick_height, colors='black')
+    ax_lickport.set_ylabel('lickport pos (mm)')
+    plt.setp(ax_lickport.get_xticklabels(), visible=False)  # x axis is shared with the panel below
+
+    # --- the same (baseline-corrected, axis-remapped) LR/PA traces used above, plotted against
+    # absolute session time instead of space, one line per trial so gaps between non-adjacent/
+    # unselected trials aren't bridged by a spurious connecting line ---
+    for trial, trial_start, trial_end, f_time, lr, pa in zip(
+            time_trials, np.asarray(trial_starts, float), np.asarray(trial_ends, float), force_times, lr_traces, pa_traces):
+        trial = int(trial)
+        _shade_trial_periods(ax_force_time, trial, trial_start, trial_end)
         abs_time = trial_start + np.asarray(f_time, float)
         ax_force_time.plot(abs_time, lr, '-', color='tab:blue', linewidth=0.7, alpha=0.7)
         ax_force_time.plot(abs_time, pa, '-', color='tab:orange', linewidth=0.7, alpha=0.7)
@@ -306,10 +349,12 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     ax_force_time.legend(handles=[
         Line2D([0], [0], color='tab:blue', label='Left - Right'),
         Line2D([0], [0], color='tab:orange', label='Posterior - Anterior'),
+        Line2D([0], [0], color='tab:purple', label='lickport pos'),
+        Line2D([0], [0], color='black', marker='|', linestyle='None', markersize=8, label='licks'),
         Patch(color='gray', alpha=0.3, label='quiescence'),
         Patch(color='gold', alpha=0.3, label='response'),
         Line2D([0], [0], color='green', label='reward'),
-    ], loc='upper center', bbox_to_anchor=(0.5, -0.15), fontsize=8, ncol=5)
+    ], loc='upper center', bbox_to_anchor=(0.5, -0.15), fontsize=8, ncol=7)
 
     if fig_dir is not None:
         os.makedirs(fig_dir, exist_ok=True)
