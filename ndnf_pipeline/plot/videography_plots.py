@@ -327,7 +327,6 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
 
     all_lickport_t    = data['all_lickport_t']
     all_lickport_norm = data['all_lickport_norm']
-    all_reward_t      = data['all_reward_t']
     all_threshold_t   = data['all_threshold_t']
     all_lick_t        = data['all_lick_t']
 
@@ -361,10 +360,6 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
     # at each gap in the raw log (e.g. an unlogged quiescence period), so a straight line would
     # draw those as a gradual ramp instead of the flat hold they actually represent
     ax_lickport.step(all_lickport_t[lp_mask] - x0, all_lickport_norm[lp_mask], 'k-', where='post')
-    if all_reward_t.size:
-        rew_mask = (all_reward_t >= t_video_start) & (all_reward_t <= t_end)
-        ax_lickport.plot(all_reward_t[rew_mask] - x0,
-                          np.zeros(rew_mask.sum()) - 0.1, 'o', color='lightblue', markersize=10)
     if all_threshold_t.size:
         thr_mask = (all_threshold_t >= t_video_start) & (all_threshold_t <= t_end)
         ax_lickport.plot(all_threshold_t[thr_mask] - x0,
@@ -372,8 +367,10 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
                           markersize=14, markeredgecolor='orange', markeredgewidth=1, zorder=5)
     ax_lickport.axvline(t_now - x0, color='r', linestyle='--', linewidth=1)
     ax_lickport.set_xlim([0, t_video_end - x0])
-    ax_lickport.set_xticks([])
-    ax_lickport.set_yticks([])
+    ax_lickport.set_yticks([0, 1])
+    ax_lickport.set_yticklabels([labels['fb_start'], labels['fb_target']])
+    ax_lickport.set_xlabel(labels['time'])
+    ax_lickport.set_ylabel(labels['feedback'])
 
     return fig
 
