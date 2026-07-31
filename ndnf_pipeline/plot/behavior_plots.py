@@ -300,20 +300,28 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
         lickport_query = lickport_query & trial_restriction
     lp_trials, lp_trial_starts, lp_times, lp_values = lickport_query.fetch(
         'trial', 'trial_start_time', 'reward_port_position_time', 'reward_port_position_values', order_by='trial')
+    lickport_carry = None  # last known lickport position, carried across the trial-to-trial gap
     for trial, trial_start, lp_time, lp_val in zip(lp_trials, np.asarray(lp_trial_starts, float), lp_times, lp_values):
         trial = int(trial)
         trial_end = trial_end_by_num.get(trial, trial_start)
         _shade_trial_periods(ax_lickport, trial, trial_start, trial_end)
         lp_time_arr = np.asarray(lp_time, float)
         lp_val_arr = np.asarray(lp_val, float)
+        # the port stays closed (wherever the last reward left it) through the whole quiescence
+        # period -- nothing touches it, and it isn't logged again until the 'go' event opens it
+        # for the response period -- so hold the last known value (carried over from the previous
+        # trial if this trial hasn't logged anything yet) until that first real sample, rather than
+        # letting a plain connecting line ramp gradually across the silent gap
         if len(lp_time_arr) == 0:
+            if lickport_carry is not None:
+                ax_lickport.step([trial_start, trial_end], [lickport_carry, lickport_carry], where='post',
+                                  color='tab:purple', linewidth=0.8, alpha=0.8)
             continue
-        # the port is only logged when it moves, so hold each value forward (step, not linear
-        # interpolation) until the next logged sample, and extend the first/last known value
-        # out to the trial's own start/end so the trace covers the full trial with no gaps
+        lead_val = lickport_carry if lickport_carry is not None else lp_val_arr[0]
         ext_time_abs = np.concatenate([[trial_start], trial_start + lp_time_arr, [trial_end]])
-        ext_val = np.concatenate([[lp_val_arr[0]], lp_val_arr, [lp_val_arr[-1]]])
+        ext_val = np.concatenate([[lead_val], lp_val_arr, [lp_val_arr[-1]]])
         ax_lickport.step(ext_time_abs, ext_val, where='post', color='tab:purple', linewidth=0.8, alpha=0.8)
+        lickport_carry = lp_val_arr[-1]
 
     lick_query = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
                   & {**key, 'trial_event_type': 'lick'})
