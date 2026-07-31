@@ -448,10 +448,13 @@ class VideoGenerationTab(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
-        self._crop = (0, 0, 0, 0)
-        self._crop_frame_shape = None
-        self._crop_selector = None
+        # per-camera-slot crop state (1 = primary camera, 2 = optional second camera)
+        self._cam = {
+            1: dict(crop=(0, 0, 0, 0), frame_shape=None, selector=None),
+            2: dict(crop=(0, 0, 0, 0), frame_shape=None, selector=None),
+        }
         self._preview_clims = None
+        self._preview_clims_2 = None
         self._output_path = None
         self._render_queue = queue.Queue()
         self._inherited_block = None
@@ -465,10 +468,20 @@ class VideoGenerationTab(ttk.Frame):
         ttk.Label(selectors, textvariable=self.inherited_label_var, foreground="gray").pack(side="left", padx=(4, 10))
         ttk.Button(selectors, text="Refresh from Block Detail", command=self.sync_from_block_detail).pack(side="left")
 
-        ttk.Label(selectors, text="Camera:").pack(side="left", padx=(16, 0))
+        cameras_row = ttk.Frame(self)
+        cameras_row.pack(fill="x", padx=5, pady=(2, 0))
+        ttk.Label(cameras_row, text="Camera 1:").pack(side="left")
         self.camera_var = tk.StringVar()
-        self.camera_cb = ttk.Combobox(selectors, textvariable=self.camera_var, state="readonly", width=14)
+        self.camera_cb = ttk.Combobox(cameras_row, textvariable=self.camera_var, state="readonly", width=14)
         self.camera_cb.pack(side="left", padx=(4, 10))
+
+        self.use_camera_2 = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cameras_row, text="Add a 2nd camera (stacked below camera 1)",
+                        variable=self.use_camera_2, command=self._on_camera2_toggle).pack(side="left", padx=(10, 0))
+        ttk.Label(cameras_row, text="Camera 2:").pack(side="left", padx=(10, 0))
+        self.camera_2_var = tk.StringVar()
+        self.camera_2_cb = ttk.Combobox(cameras_row, textvariable=self.camera_2_var, state="disabled", width=14)
+        self.camera_2_cb.pack(side="left", padx=(4, 10))
 
         params = ttk.Frame(self)
         params.pack(fill="x", padx=5, pady=(4, 0))
@@ -498,16 +511,32 @@ class VideoGenerationTab(ttk.Frame):
         ttk.Combobox(params, textvariable=self.lang_var, state="readonly", width=4,
                      values=["en", "hu"]).pack(side="left", padx=(2, 0))
 
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", padx=5, pady=(4, 4))
-        ttk.Button(actions, text="Load frame for cropping", command=self.load_frame_for_cropping).pack(side="left")
-        ttk.Button(actions, text="Apply crop from selection", command=self.apply_crop).pack(side="left", padx=(6, 0))
-        ttk.Button(actions, text="Reset crop", command=self.reset_crop).pack(side="left", padx=(6, 0))
+        actions_cam1 = ttk.Frame(self)
+        actions_cam1.pack(fill="x", padx=5, pady=(4, 2))
+        ttk.Label(actions_cam1, text="Camera 1 crop:").pack(side="left")
+        ttk.Button(actions_cam1, text="Load frame", command=lambda: self.load_frame_for_cropping(1)).pack(side="left", padx=(6, 0))
+        ttk.Button(actions_cam1, text="Apply crop", command=lambda: self.apply_crop(1)).pack(side="left", padx=(6, 0))
+        ttk.Button(actions_cam1, text="Reset crop", command=lambda: self.reset_crop(1)).pack(side="left", padx=(6, 0))
         self.crop_label_var = tk.StringVar(value="crop: left=0 right=0 top=0 bottom=0")
-        ttk.Label(actions, textvariable=self.crop_label_var).pack(side="left", padx=(10, 0))
+        ttk.Label(actions_cam1, textvariable=self.crop_label_var).pack(side="left", padx=(10, 0))
+
+        actions_cam2 = ttk.Frame(self)
+        actions_cam2.pack(fill="x", padx=5, pady=(0, 2))
+        ttk.Label(actions_cam2, text="Camera 2 crop:").pack(side="left")
+        self.load_frame_2_btn = ttk.Button(actions_cam2, text="Load frame", state="disabled",
+                                            command=lambda: self.load_frame_for_cropping(2))
+        self.load_frame_2_btn.pack(side="left", padx=(6, 0))
+        self.apply_crop_2_btn = ttk.Button(actions_cam2, text="Apply crop", state="disabled",
+                                            command=lambda: self.apply_crop(2))
+        self.apply_crop_2_btn.pack(side="left", padx=(6, 0))
+        self.reset_crop_2_btn = ttk.Button(actions_cam2, text="Reset crop", state="disabled",
+                                            command=lambda: self.reset_crop(2))
+        self.reset_crop_2_btn.pack(side="left", padx=(6, 0))
+        self.crop_label_var_2 = tk.StringVar(value="crop: left=0 right=0 top=0 bottom=0")
+        ttk.Label(actions_cam2, textvariable=self.crop_label_var_2).pack(side="left", padx=(10, 0))
 
         actions2 = ttk.Frame(self)
-        actions2.pack(fill="x", padx=5, pady=(0, 4))
+        actions2.pack(fill="x", padx=5, pady=(2, 4))
         ttk.Button(actions2, text="Preview", command=self.do_preview).pack(side="left")
         ttk.Button(actions2, text="Choose output file...", command=self.choose_output_path).pack(side="left", padx=(6, 0))
         self.output_label_var = tk.StringVar(value="(no output file chosen)")
@@ -517,16 +546,24 @@ class VideoGenerationTab(ttk.Frame):
         self.render_progress = ttk.Progressbar(actions2, mode="indeterminate", length=120)
         self.render_progress.pack(side="left", padx=(10, 0))
 
+        # preview opens in its own pop-out window (see _show_preview_window) instead of an
+        # embedded panel, so it renders at the dashboard figure's true aspect ratio instead of
+        # being stretched to fill whatever space an embedded panel happens to have
+        self._preview_window = None
+        self._preview_fig = None
+
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=5, pady=(0, 5))
-        crop_frame = ttk.LabelFrame(body, text="Crop selection (drag the box edges)")
+        crop_frame = ttk.LabelFrame(body, text="Camera 1 crop selection (drag the box edges)")
         crop_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
         self.crop_panel = PlotPanel(crop_frame)
         self.crop_panel.pack(fill="both", expand=True)
-        preview_frame = ttk.LabelFrame(body, text="Preview (last frame)")
-        preview_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        self.preview_panel = PlotPanel(preview_frame)
-        self.preview_panel.pack(fill="both", expand=True)
+        crop_frame_2 = ttk.LabelFrame(body, text="Camera 2 crop selection (drag the box edges)")
+        crop_frame_2.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self.crop_panel_2 = PlotPanel(crop_frame_2)
+        self.crop_panel_2.pack(fill="both", expand=True)
+        self._crop_panels = {1: self.crop_panel, 2: self.crop_panel_2}
+        self._crop_label_vars = {1: self.crop_label_var, 2: self.crop_label_var_2}
 
     # --- inherit block/trials from the Block Detail tab ---
     def on_session_changed(self):
@@ -537,6 +574,8 @@ class VideoGenerationTab(ttk.Frame):
         subject_id, session = self.app.get_selected_subject_session()
         self.camera_cb["values"] = []
         self.camera_var.set("")
+        self.camera_2_cb["values"] = []
+        self.camera_2_var.set("")
         if subject_id is None or session is None:
             return
         try:
@@ -547,8 +586,18 @@ class VideoGenerationTab(ttk.Frame):
             self.app.report_error(exc)
             return
         self.camera_cb["values"] = cameras
+        self.camera_2_cb["values"] = cameras
         if cameras:
             self.camera_var.set(cameras[0])
+            self.camera_2_var.set(cameras[1] if len(cameras) > 1 else cameras[0])
+
+    def _on_camera2_toggle(self):
+        enabled = self.use_camera_2.get()
+        self.camera_2_cb.config(state="readonly" if enabled else "disabled")
+        state = "normal" if enabled else "disabled"
+        self.load_frame_2_btn.config(state=state)
+        self.apply_crop_2_btn.config(state=state)
+        self.reset_crop_2_btn.config(state=state)
 
     def sync_from_block_detail(self):
         """Re-read the Block Detail tab's block + trial selection (none selected there = every
@@ -603,11 +652,12 @@ class VideoGenerationTab(ttk.Frame):
             return default
 
     def _current_params(self):
-        """Read + validate the inherited block/trial-range plus the camera selection. Returns
+        """Read + validate the inherited block/trial-range plus the camera selection(s). Returns
         load_trial_video_data kwargs, or None (after reporting the problem) if something
         required is missing/invalid."""
         subject_id, session = self.app.get_selected_subject_session()
         camera = self.camera_var.get()
+        camera_2 = self.camera_2_var.get() if self.use_camera_2.get() else None
         if subject_id is None or session is None:
             self.app.report_error(RuntimeError("Select a subject and session first."))
             return None
@@ -619,9 +669,12 @@ class VideoGenerationTab(ttk.Frame):
         if not camera:
             self.app.report_error(RuntimeError("No camera recordings available for this session."))
             return None
+        if self.use_camera_2.get() and not camera_2:
+            self.app.report_error(RuntimeError("Pick a second camera, or uncheck 'Add a 2nd camera'."))
+            return None
         return dict(subject_id=subject_id, session=session, block=self._inherited_block,
                     trial_start=self._inherited_trial_start, trial_end=self._inherited_trial_end,
-                    camera_name=camera,
+                    camera_name=camera, camera_name_2=camera_2,
                     pad_start=self._read_float(self.pad_start_var, 1.0),
                     pad_end=self._read_float(self.pad_end_var, 1.0))
 
@@ -634,56 +687,65 @@ class VideoGenerationTab(ttk.Frame):
         )
 
     # --- actions ---
-    def load_frame_for_cropping(self):
+    def load_frame_for_cropping(self, slot):
         params = self._current_params()
         if params is None:
             return
-        self.app.status_var.set("Loading frame...")
+        if slot == 2 and not params.get("camera_name_2"):
+            self.app.report_error(RuntimeError("Pick a second camera first."))
+            return
+        self.app.status_var.set(f"Loading frame (camera {slot})...")
         self.app.update_idletasks()
         try:
             from ndnf_pipeline.plot.videography_plots import load_trial_video_data, preview_last_frame, _prepare_frame
             data = load_trial_video_data(**params)
             render_kwargs = self._render_kwargs()
-            dashboard_fig, last_frame, clims = preview_last_frame(data, crop=(0, 0, 0, 0),
-                                                                    clim_pct=render_kwargs["clim_pct"])
+            dashboard_fig, last_frame, clims, last_frame_2, clims_2 = preview_last_frame(
+                data, crop=(0, 0, 0, 0), crop_2=(0, 0, 0, 0) if params.get("camera_name_2") else None,
+                clim_pct=render_kwargs["clim_pct"])
             plt.close(dashboard_fig)
-            rgb = _prepare_frame(last_frame, (0, 0, 0, 0), clims)
-            h, w = last_frame.shape[:2]
+            frame = last_frame if slot == 1 else last_frame_2
+            frame_clims = clims if slot == 1 else clims_2
+            rgb = _prepare_frame(frame, (0, 0, 0, 0), frame_clims)
+            h, w = frame.shape[:2]
             fig, ax = plt.subplots(figsize=(7, max(4.0, 7 * h / w)))
             ax.imshow(rgb)
             ax.set_title("Drag the box edges/corners to set the crop, then click 'Apply crop'", fontsize=9)
-            left, right, top, bottom = self._crop
+            cam = self._cam[slot]
+            left, right, top, bottom = cam["crop"]
             selector = RectangleSelector(ax, onselect=lambda *a: None, useblit=False, interactive=True,
                                           button=[1], minspanx=5, minspany=5, spancoords="pixels",
                                           drag_from_anywhere=True)
             selector.extents = (left, max(w - right, left + 1), top, max(h - bottom, top + 1))
-            self._crop_selector = selector
-            self._crop_frame_shape = (h, w)
-            self.crop_panel.show_figure(fig)
-            self.app.status_var.set("Frame loaded - adjust the crop box, then click 'Apply crop'.")
+            cam["selector"] = selector
+            cam["frame_shape"] = (h, w)
+            self._crop_panels[slot].show_figure(fig)
+            self.app.status_var.set(f"Frame loaded (camera {slot}) - adjust the crop box, then click 'Apply crop'.")
         except Exception as exc:
             self.app.report_error(exc)
             self.app.status_var.set("Failed to load frame - see error dialog.")
 
-    def apply_crop(self):
-        if self._crop_selector is None or self._crop_frame_shape is None:
+    def apply_crop(self, slot):
+        cam = self._cam[slot]
+        if cam["selector"] is None or cam["frame_shape"] is None:
             self.app.report_error(RuntimeError("Load a frame for cropping first."))
             return
-        xmin, xmax, ymin, ymax = self._crop_selector.extents
-        h, w = self._crop_frame_shape
+        xmin, xmax, ymin, ymax = cam["selector"].extents
+        h, w = cam["frame_shape"]
         left = int(round(max(0, xmin)))
         right = int(round(max(0, w - xmax)))
         top = int(round(max(0, ymin)))
         bottom = int(round(max(0, h - ymax)))
-        self._crop = (left, right, top, bottom)
-        self.crop_label_var.set(f"crop: left={left} right={right} top={top} bottom={bottom}")
+        cam["crop"] = (left, right, top, bottom)
+        self._crop_label_vars[slot].set(f"crop: left={left} right={right} top={top} bottom={bottom}")
 
-    def reset_crop(self):
-        self._crop = (0, 0, 0, 0)
-        self.crop_label_var.set("crop: left=0 right=0 top=0 bottom=0")
-        if self._crop_selector is not None and self._crop_frame_shape is not None:
-            h, w = self._crop_frame_shape
-            self._crop_selector.extents = (0, w, 0, h)
+    def reset_crop(self, slot):
+        cam = self._cam[slot]
+        cam["crop"] = (0, 0, 0, 0)
+        self._crop_label_vars[slot].set("crop: left=0 right=0 top=0 bottom=0")
+        if cam["selector"] is not None and cam["frame_shape"] is not None:
+            h, w = cam["frame_shape"]
+            cam["selector"].extents = (0, w, 0, h)
 
     def do_preview(self):
         params = self._current_params()
@@ -695,22 +757,55 @@ class VideoGenerationTab(ttk.Frame):
             from ndnf_pipeline.plot.videography_plots import load_trial_video_data, preview_last_frame
             data = load_trial_video_data(**params)
             render_kwargs = self._render_kwargs()
-            fig, last_frame, clims = preview_last_frame(data, crop=self._crop, **render_kwargs)
+            crop_2 = self._cam[2]["crop"] if params.get("camera_name_2") else None
+            fig, last_frame, clims, last_frame_2, clims_2 = preview_last_frame(
+                data, crop=self._cam[1]["crop"], crop_2=crop_2, **render_kwargs)
             self._preview_clims = clims
-            self.preview_panel.show_figure(fig)
+            self._preview_clims_2 = clims_2
+            self._show_preview_window(fig)
             self.app.status_var.set("Preview ready.")
         except Exception as exc:
             self.app.report_error(exc)
             self.app.status_var.set("Preview failed - see error dialog.")
 
+    def _show_preview_window(self, fig):
+        """Show fig in its own Toplevel, sized to its true aspect ratio (capped so it fits on
+        screen) and non-resizable, so the dashboard is never stretched out of proportion."""
+        if self._preview_window is not None and self._preview_window.winfo_exists():
+            self._preview_window.destroy()
+        if self._preview_fig is not None:
+            plt.close(self._preview_fig)
+
+        fig_w_in, fig_h_in = fig.get_size_inches()
+        dpi = fig.get_dpi()
+        native_w, native_h = fig_w_in * dpi, fig_h_in * dpi
+        max_w, max_h = 1400, 900
+        scale = min(1.0, max_w / native_w, max_h / native_h)
+        win_w, win_h = int(native_w * scale), int(native_h * scale + 40)  # + toolbar height
+
+        win = tk.Toplevel(self.app)
+        win.title("Video preview")
+        win.geometry(f"{win_w}x{win_h}")
+        win.resizable(False, False)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        self._preview_window = win
+        self._preview_fig = fig
+
     def choose_output_path(self):
         subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.block_var.get()
         camera = self.camera_var.get()
+        camera_suffix = camera
+        if self.use_camera_2.get() and self.camera_2_var.get():
+            camera_suffix = f"{camera}+{self.camera_2_var.get()}"
         default_name = "video.mp4"
-        if subject_id and session is not None and block_str and camera:
-            default_name = (f"{subject_id}_s{session}_b{block_str}_"
-                             f"t{self.trial_start_var.get()}-{self.trial_end_var.get()}_{camera}.mp4")
+        if subject_id and session is not None and self._inherited_block is not None and camera:
+            default_name = (f"{subject_id}_s{session}_b{self._inherited_block}_"
+                             f"t{self._inherited_trial_start}-{self._inherited_trial_end}_{camera_suffix}.mp4")
         cfg = dj_connection.load_gui_config()
         initial_dir = cfg.get("video_output_dir") or str(Path.home())
         path = filedialog.asksaveasfilename(
@@ -733,8 +828,10 @@ class VideoGenerationTab(ttk.Frame):
         render_kwargs = self._render_kwargs()
         speed = self._read_float(self.speed_var, 1.0)
         fps = self._read_int(self.fps_var, 20)
-        crop = self._crop
+        crop = self._cam[1]["crop"]
+        crop_2 = self._cam[2]["crop"] if params.get("camera_name_2") else None
         clims = self._preview_clims
+        clims_2 = self._preview_clims_2 if params.get("camera_name_2") else None
         output_path = self._output_path
 
         self.render_button.config(state="disabled")
@@ -746,7 +843,7 @@ class VideoGenerationTab(ttk.Frame):
                 from ndnf_pipeline.plot.videography_plots import load_trial_video_data, render_trial_video
                 data = load_trial_video_data(**params)
                 render_trial_video(data, output_path, video_fps=fps, playback_speed=speed,
-                                    crop=crop, clims=clims, **render_kwargs)
+                                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
                 self._render_queue.put(("done", output_path))
             except Exception as exc:
                 self._render_queue.put(("error", exc))
@@ -830,6 +927,14 @@ class BehaviorGUI(tk.Tk):
         self.notebook.add(self.video_generation_tab, text="Generate Video")
         self._tabs = (self.session_overview_tab, self.block_detail_tab, self.subject_trend_tab,
                        self.trials_per_mouse_tab, self.water_restriction_tab, self.video_generation_tab)
+        # the video tab inherits its block/trial selection from Block Detail, which can change
+        # without a session change (different block, different trial selection) — resync on
+        # every tab switch so it's never showing a stale block/trial range
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, event):
+        if self.notebook.nametowidget(self.notebook.select()) is self.video_generation_tab:
+            self.video_generation_tab.sync_from_block_detail()
 
     def _build_status_bar(self):
         self.status_var = tk.StringVar(value="Not connected.")
