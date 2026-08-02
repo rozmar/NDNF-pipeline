@@ -139,10 +139,15 @@ class PerfAxisControls(pn.Row):
         return window if window and window >= 1 else self._default_window
 
 
-def make_plot_pane(height=520):
-    """A Matplotlib pane analogous to Tkinter's PlotPanel; swap figures via show_figure()."""
-    return pn.pane.Matplotlib(None, tight=True, format="png", dpi=110, height=height,
-                               sizing_mode="stretch_width")
+def make_plot_pane():
+    """A Matplotlib pane analogous to Tkinter's PlotPanel; swap figures via show_figure().
+
+    No fixed height: the pane fills the available width and lets height follow the figure's
+    own aspect ratio (Matplotlib pane's default fixed_aspect=True) instead of squashing a
+    portrait figure - e.g. Block Detail's 12x19in figure - down into a small fixed box. A
+    tall figure then means scrolling to see all of it, which beats shrinking it to be tiny.
+    """
+    return pn.pane.Matplotlib(None, tight=True, format="png", dpi=110, sizing_mode="stretch_width")
 
 
 def show_figure(pane, fig):
@@ -365,8 +370,8 @@ class TrialsPerMouseTab:
         none_btn.on_click(lambda e: self.select_none())
         reload_btn.on_click(lambda e: self.reload_mice())
 
-        self.bar_pane = make_plot_pane(height=340)
-        self.trend_pane = make_plot_pane(height=340)
+        self.bar_pane = make_plot_pane()
+        self.trend_pane = make_plot_pane()
 
         left = pn.Column(self.mouse_select, pn.Row(all_btn, none_btn), reload_btn, width=200)
         right = pn.Column(
@@ -543,7 +548,7 @@ class VideoGenerationTab:
         )
 
         # --- preview / render ---
-        self.preview_pane = make_plot_pane(height=560)
+        self.preview_pane = make_plot_pane()
         self.preview_modal = pn.Modal(self.preview_pane, name="Video preview")
 
         preview_btn = pn.widgets.Button(name="Preview", width=90)
