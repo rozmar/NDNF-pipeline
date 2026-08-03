@@ -18,6 +18,9 @@ google_creds.json
 *.pem
 *.key
 
+# GUI config: remembers a machine-local dj_local_conf.json path, not portable
+GUIs/gui_config.json
+
 # IDE
 .vscode/
 .idea/
