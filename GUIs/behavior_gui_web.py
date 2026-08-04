@@ -139,6 +139,28 @@ class PerfAxisControls(pn.Row):
         return window if window and window >= 1 else self._default_window
 
 
+class EpochSelector(pn.Row):
+    """Checkboxes restricting the force histogram/trajectory (and force-vs-time) panels to
+    samples within selected trial epoch(s): quiescence, response, reward consumption.
+
+    All three checked (the default) is equivalent to no restriction at all.
+    """
+    EPOCHS = ('quiescence', 'response', 'reward')
+    LABELS = {'quiescence': 'Quiescence', 'response': 'Response', 'reward': 'Reward'}
+
+    def __init__(self, on_change, default_selected=EPOCHS, **params):
+        self.on_change = on_change
+        self.checkboxes = {epoch: pn.widgets.Checkbox(name=self.LABELS[epoch], value=epoch in default_selected)
+                            for epoch in self.EPOCHS}
+        for cb in self.checkboxes.values():
+            cb.param.watch(lambda e: self.on_change(), "value")
+        super().__init__(pn.widgets.StaticText(value="Epochs:", margin=(8, 5)),
+                          *self.checkboxes.values(), **params)
+
+    def get_selected_epochs(self):
+        return tuple(epoch for epoch in self.EPOCHS if self.checkboxes[epoch].value)
+
+
 def make_plot_pane():
     """A Matplotlib pane analogous to Tkinter's PlotPanel; swap figures via show_figure().
 
@@ -174,10 +196,11 @@ class SessionOverviewTab:
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
         self.subtract_median.param.watch(lambda e: self.refresh(), "value")
         refresh_btn.on_click(lambda e: self.refresh())
+        self.epoch_selector = EpochSelector(on_change=self.refresh)
 
         self.pane = make_plot_pane()
         controls = pn.Row(self.subtract_median, self.range_control, self.perf_controls, refresh_btn)
-        self.panel = pn.Column(controls, self.pane)
+        self.panel = pn.Column(controls, self.epoch_selector, self.pane)
 
     def on_session_changed(self):
         self.refresh()
@@ -196,7 +219,8 @@ class SessionOverviewTab:
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
-                perf_smoothing_window=self.perf_controls.get_smoothing_window())
+                perf_smoothing_window=self.perf_controls.get_smoothing_window(),
+                epochs=self.epoch_selector.get_selected_epochs())
 
         self.app.run_plot(work, self.pane)
 
@@ -224,6 +248,7 @@ class BlockDetailTab:
         self.block_select.param.watch(self._block_guard.wrap(lambda e: self.on_block_selected()), "value")
         self.subtract_median.param.watch(lambda e: self.refresh(), "value")
         refresh_btn.on_click(lambda e: self.refresh())
+        self.epoch_selector = EpochSelector(on_change=self.refresh)
 
         self.trial_select = pn.widgets.MultiSelect(
             name="Trials for 2D hist & trajectories (none = all)", options=[], size=20, width=150)
@@ -238,7 +263,7 @@ class BlockDetailTab:
                            self.perf_controls, refresh_btn)
         left = pn.Column(self.trial_select, pn.Row(all_btn, none_btn), width=170)
         body = pn.Row(left, self.pane)
-        self.panel = pn.Column(controls, body)
+        self.panel = pn.Column(controls, self.epoch_selector, body)
 
     def on_session_changed(self):
         subject_id, session = self.app.get_selected_subject_session()
@@ -318,7 +343,8 @@ class BlockDetailTab:
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
                 perf_smoothing_window=self.perf_controls.get_smoothing_window(),
-                trials=selected_trials or None)
+                trials=selected_trials or None,
+                epochs=self.epoch_selector.get_selected_epochs())
 
         self.app.run_plot(work, self.pane)
 

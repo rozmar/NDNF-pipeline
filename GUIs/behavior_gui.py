@@ -91,6 +91,30 @@ class PerfAxisControls(ttk.Frame):
         return window
 
 
+class EpochSelector(ttk.Frame):
+    """Checkboxes restricting the force histogram/trajectory (and force-vs-time) panels to
+    samples within selected trial epoch(s): quiescence, response, reward consumption.
+
+    All three checked (the default) is equivalent to no restriction at all.
+    """
+    EPOCHS = ('quiescence', 'response', 'reward')
+    LABELS = {'quiescence': 'Quiescence', 'response': 'Response', 'reward': 'Reward'}
+
+    def __init__(self, master, on_change, default_selected=EPOCHS):
+        super().__init__(master)
+        self.on_change = on_change
+        ttk.Label(self, text="Epochs:").pack(side="left")
+        self.vars = {}
+        for epoch in self.EPOCHS:
+            var = tk.BooleanVar(value=epoch in default_selected)
+            self.vars[epoch] = var
+            ttk.Checkbutton(self, text=self.LABELS[epoch], variable=var,
+                             command=self.on_change).pack(side="left", padx=(4, 0))
+
+    def get_selected_epochs(self):
+        return tuple(epoch for epoch in self.EPOCHS if self.vars[epoch].get())
+
+
 class PlotPanel(ttk.Frame):
     """A frame holding a matplotlib canvas + navigation toolbar; swap figures via show_figure()."""
 
@@ -142,6 +166,10 @@ class SessionOverviewTab(ttk.Frame):
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
         self.perf_controls.pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+        controls2 = ttk.Frame(self)
+        controls2.pack(fill="x", padx=5, pady=(0, 5))
+        self.epoch_selector = EpochSelector(controls2, on_change=self.refresh)
+        self.epoch_selector.pack(side="left")
         self.panel = PlotPanel(self)
         self.panel.pack(fill="both", expand=True)
 
@@ -162,7 +190,8 @@ class SessionOverviewTab(ttk.Frame):
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
-                perf_smoothing_window=self.perf_controls.get_smoothing_window())
+                perf_smoothing_window=self.perf_controls.get_smoothing_window(),
+                epochs=self.epoch_selector.get_selected_epochs())
 
         self.app.run_plot(work, self.panel)
 
@@ -193,6 +222,10 @@ class BlockDetailTab(ttk.Frame):
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
         self.perf_controls.pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+        controls2 = ttk.Frame(self)
+        controls2.pack(fill="x", padx=5, pady=(0, 5))
+        self.epoch_selector = EpochSelector(controls2, on_change=self.refresh)
+        self.epoch_selector.pack(side="left")
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
@@ -287,7 +320,8 @@ class BlockDetailTab(ttk.Frame):
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
                 perf_smoothing_window=self.perf_controls.get_smoothing_window(),
-                trials=selected_trials or None)
+                trials=selected_trials or None,
+                epochs=self.epoch_selector.get_selected_epochs())
 
         self.app.run_plot(work, self.panel)
 
