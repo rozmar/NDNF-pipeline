@@ -161,6 +161,99 @@ class EpochSelector(pn.Row):
         return tuple(epoch for epoch in self.EPOCHS if self.checkboxes[epoch].value)
 
 
+class TraceFilterControls(pn.Row):
+    """Dropdown + millisecond-based parameter inputs to smooth each trial's force trace
+    before it feeds the histogram/trajectory/force-vs-time panels: none, boxcar (moving
+    average), median, gaussian, or Savitzky-Golay (a local polynomial fit -- keeps peak shape
+    better than the other three, at the cost of needing a window wide enough to fit the
+    chosen order).
+
+    Window/sigma are entered in milliseconds rather than samples, since the raw sample count
+    for a given duration depends on the (block-specific) force trace sampling rate; a gray
+    "(~N samples)" hint next to each input shows what that currently works out to, updated via
+    set_sample_interval() whenever the selected block's sampling rate becomes known. Only the
+    parameter input(s) relevant to the selected method are enabled.
+    """
+    METHODS = ('none', 'boxcar', 'median', 'gaussian', 'savgol')
+    METHOD_LABELS = {
+        'none': 'None', 'boxcar': 'Boxcar (moving avg)', 'median': 'Median',
+        'gaussian': 'Gaussian', 'savgol': 'Savitzky-Golay',
+    }
+    RELEVANT_PARAMS = {
+        'none': (), 'boxcar': ('window',), 'median': ('window',),
+        'gaussian': ('sigma',), 'savgol': ('window', 'polyorder'),
+    }
+
+    def __init__(self, on_change, **params):
+        self.on_change = on_change
+        self._sample_interval_s = None  # seconds/sample for the currently selected block
+        self.method_select = pn.widgets.Select(name="Trace filter",
+                                                 options=[self.METHOD_LABELS[m] for m in self.METHODS],
+                                                 value=self.METHOD_LABELS['none'], width=170)
+        self.window_ms_input = pn.widgets.FloatInput(name="window (ms)", value=50.0, start=0, width=90)
+        self.window_hint = pn.widgets.StaticText(value="", margin=(22, 0, 0, 5))
+        self.sigma_ms_input = pn.widgets.FloatInput(name="sigma (ms)", value=20.0, start=0, width=90)
+        self.sigma_hint = pn.widgets.StaticText(value="", margin=(22, 0, 0, 5))
+        self.polyorder_input = pn.widgets.IntInput(name="poly order", value=3, start=0, width=90)
+        self.method_select.param.watch(lambda e: self._on_method_changed(), "value")
+        self.window_ms_input.param.watch(lambda e: self._on_param_changed(), "value")
+        self.sigma_ms_input.param.watch(lambda e: self._on_param_changed(), "value")
+        self.polyorder_input.param.watch(lambda e: self.on_change(), "value")
+        super().__init__(self.method_select, self.window_ms_input, self.window_hint,
+                          self.sigma_ms_input, self.sigma_hint, self.polyorder_input, **params)
+        self._update_enabled_state()
+        self._update_hints()
+
+    def _method_key(self):
+        label = self.method_select.value
+        for key, lbl in self.METHOD_LABELS.items():
+            if lbl == label:
+                return key
+        return 'none'
+
+    def _on_method_changed(self):
+        self._update_enabled_state()
+        self.on_change()
+
+    def _on_param_changed(self):
+        self._update_hints()
+        self.on_change()
+
+    def _update_enabled_state(self):
+        relevant = self.RELEVANT_PARAMS[self._method_key()]
+        self.window_ms_input.disabled = 'window' not in relevant
+        self.sigma_ms_input.disabled = 'sigma' not in relevant
+        self.polyorder_input.disabled = 'polyorder' not in relevant
+
+    def set_sample_interval(self, sample_interval_s):
+        """Called by the tab when the selected block's force-trace sampling rate becomes
+        known (or unknown, with None), so the "(~N samples)" hints stay accurate."""
+        self._sample_interval_s = sample_interval_s
+        self._update_hints()
+
+    def _update_hints(self):
+        window_ms = self.window_ms_input.value or 0.0
+        sigma_ms = self.sigma_ms_input.value or 0.0
+        if self._sample_interval_s:
+            # imported here (not at module load) so constructing this widget before a
+            # DataJoint connection exists never touches the ndnf_pipeline package -- see
+            # set_sample_interval(), which is the only caller that can make this branch true
+            from ndnf_pipeline.plot.behavior_plots import ms_to_samples, ms_to_samples_float
+            window_samples = ms_to_samples(window_ms, self._sample_interval_s)
+            sigma_samples = ms_to_samples_float(sigma_ms, self._sample_interval_s)
+            self.window_hint.value = f"(~{window_samples} samples)"
+            self.sigma_hint.value = f"(~{sigma_samples:.1f} samples)"
+        else:
+            self.window_hint.value = "(rate unknown)"
+            self.sigma_hint.value = "(rate unknown)"
+
+    def get_filter_kwargs(self):
+        return dict(filter_method=self._method_key(),
+                    filter_window_ms=self.window_ms_input.value if self.window_ms_input.value is not None else 50.0,
+                    filter_sigma_ms=self.sigma_ms_input.value if self.sigma_ms_input.value is not None else 20.0,
+                    filter_polyorder=self.polyorder_input.value if self.polyorder_input.value is not None else 3)
+
+
 def make_plot_pane():
     """A Matplotlib pane analogous to Tkinter's PlotPanel; swap figures via show_figure().
 
@@ -190,17 +283,14 @@ class SessionOverviewTab:
 
     def __init__(self, app):
         self.app = app
-        self.subtract_median = pn.widgets.Checkbox(name="Subtract force median", value=False)
         self.range_control = UniformRangeControl(on_change=self.refresh)
         self.perf_controls = PerfAxisControls(on_change=self.refresh)
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
-        self.subtract_median.param.watch(lambda e: self.refresh(), "value")
         refresh_btn.on_click(lambda e: self.refresh())
-        self.epoch_selector = EpochSelector(on_change=self.refresh)
 
         self.pane = make_plot_pane()
-        controls = pn.Row(self.subtract_median, self.range_control, self.perf_controls, refresh_btn)
-        self.panel = pn.Column(controls, self.epoch_selector, self.pane)
+        controls = pn.Row(self.range_control, self.perf_controls, refresh_btn)
+        self.panel = pn.Column(controls, self.pane)
 
     def on_session_changed(self):
         self.refresh()
@@ -215,12 +305,12 @@ class SessionOverviewTab:
         def work():
             return plot_session_blocks_overview(
                 subject_id, session,
-                subtract_force_median=self.subtract_median.value,
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
                 perf_smoothing_window=self.perf_controls.get_smoothing_window(),
-                epochs=self.epoch_selector.get_selected_epochs())
+                epochs=self.app.epoch_selector.get_selected_epochs(),
+                **self.app.filter_controls.get_filter_kwargs())
 
         self.app.run_plot(work, self.pane)
 
@@ -240,15 +330,12 @@ class BlockDetailTab:
         self._block_guard = _Guard()
         self._trial_guard = _Guard()
         self.block_select = pn.widgets.Select(name="Block", options=[], width=100)
-        self.subtract_median = pn.widgets.Checkbox(name="Subtract force median", value=True)
         self.range_control = UniformRangeControl(on_change=self.refresh)
         self.perf_controls = PerfAxisControls(on_change=self.refresh)
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
 
         self.block_select.param.watch(self._block_guard.wrap(lambda e: self.on_block_selected()), "value")
-        self.subtract_median.param.watch(lambda e: self.refresh(), "value")
         refresh_btn.on_click(lambda e: self.refresh())
-        self.epoch_selector = EpochSelector(on_change=self.refresh)
 
         self.trial_select = pn.widgets.MultiSelect(
             name="Trials for 2D hist & trajectories (none = all)", options=[], size=20, width=150)
@@ -259,11 +346,10 @@ class BlockDetailTab:
         none_btn.on_click(lambda e: self.select_no_trials())
 
         self.pane = make_plot_pane()
-        controls = pn.Row(self.block_select, self.subtract_median, self.range_control,
-                           self.perf_controls, refresh_btn)
+        controls = pn.Row(self.block_select, self.range_control, self.perf_controls, refresh_btn)
         left = pn.Column(self.trial_select, pn.Row(all_btn, none_btn), width=170)
         body = pn.Row(left, self.pane)
-        self.panel = pn.Column(controls, self.epoch_selector, body)
+        self.panel = pn.Column(controls, body)
 
     def on_session_changed(self):
         subject_id, session = self.app.get_selected_subject_session()
@@ -273,6 +359,7 @@ class BlockDetailTab:
             with self._trial_guard:
                 self.trial_select.options = []
             self.pane.object = None
+            self.app.update_shared_sample_interval()
             return
         try:
             blocks = sorted((self.app.experiment.Block()
@@ -291,9 +378,11 @@ class BlockDetailTab:
             with self._trial_guard:
                 self.trial_select.options = []
             self.pane.object = None
+            self.app.update_shared_sample_interval()
 
     def on_block_selected(self, *_):
         self.reload_trials()
+        self.app.update_shared_sample_interval()
         self.refresh()
 
     def reload_trials(self):
@@ -338,13 +427,13 @@ class BlockDetailTab:
         def work():
             return plot_block_force_figure(
                 subject_id, session, block,
-                subtract_force_median=self.subtract_median.value,
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
                 perf_smoothing_window=self.perf_controls.get_smoothing_window(),
                 trials=selected_trials or None,
-                epochs=self.epoch_selector.get_selected_epochs())
+                epochs=self.app.epoch_selector.get_selected_epochs(),
+                **self.app.filter_controls.get_filter_kwargs())
 
         self.app.run_plot(work, self.pane)
 
@@ -898,6 +987,14 @@ class BehaviorGUI:
         top_bar = pn.Row(self.subject_select, self.session_select, reload_btn,
                           pn.Spacer(sizing_mode="stretch_width"), settings_btn)
 
+        # Epoch selection and trace filtering apply to force data, not to a specific tab, so one
+        # shared instance of each lives here (above the tabs) and is read by both Session
+        # Overview and Block Detail -- changing either is immediately reflected in both, rather
+        # than each tab tracking its own, independently-driftable copy.
+        self.epoch_selector = EpochSelector(on_change=self._on_shared_force_controls_changed)
+        self.filter_controls = TraceFilterControls(on_change=self._on_shared_force_controls_changed)
+        shared_force_controls = pn.Column(self.epoch_selector, self.filter_controls)
+
         self.session_overview_tab = SessionOverviewTab(self)
         self.block_detail_tab = BlockDetailTab(self)
         self.subject_trend_tab = SubjectTrendTab(self)
@@ -916,6 +1013,7 @@ class BehaviorGUI:
         self.layout = pn.Column(
             pn.pane.Markdown("# NDNF Behavior Pipeline Viewer"),
             top_bar,
+            shared_force_controls,
             self.settings_modal,
             self.tabs_widget,
             self.status,
@@ -926,6 +1024,43 @@ class BehaviorGUI:
     def _on_tab_changed(self, event):
         if self._tabs[event.new] is self.video_generation_tab:
             self.video_generation_tab.sync_from_block_detail()
+
+    def _on_shared_force_controls_changed(self):
+        self.session_overview_tab.refresh()
+        self.block_detail_tab.refresh()
+
+    def update_shared_sample_interval(self):
+        """Refresh the shared filter controls' "(~N samples)" hints for whichever block is
+        current: Block Detail's own selection if it has one, else the session's first block
+        (so the hint is still useful from the Session Overview tab, which has no single
+        block of its own)."""
+        subject_id, session = self.get_selected_subject_session()
+        if subject_id is None or session is None:
+            self.filter_controls.set_sample_interval(None)
+            return
+        block_str = self.block_detail_tab.block_select.value
+        if block_str:
+            block = int(block_str)
+        else:
+            try:
+                blocks = sorted((self.experiment.Block()
+                                  & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+            except Exception as exc:
+                self.report_error(exc)
+                self.filter_controls.set_sample_interval(None)
+                return
+            block = blocks[0] if blocks else None
+        if block is None:
+            self.filter_controls.set_sample_interval(None)
+            return
+        from ndnf_pipeline.plot.behavior_plots import estimate_force_sample_interval
+
+        try:
+            sample_interval_s = estimate_force_sample_interval(subject_id, session, block)
+        except Exception as exc:
+            self.report_error(exc)
+            sample_interval_s = None
+        self.filter_controls.set_sample_interval(sample_interval_s)
 
     # --- connection ---
     def startup_connect(self):
