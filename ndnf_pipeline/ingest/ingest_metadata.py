@@ -1,6 +1,7 @@
 #%% experimenters
 import os
 import re
+import csv
 import glob
 import pandas as pd
 #import ndnf_pipeline.lab as lab
@@ -36,6 +37,37 @@ def _to_float_or_none(value):
     if value_str in ('', '-'):
         return None
     return float(value_str)
+
+def _read_sensor_summary_csv(file_path):
+    """
+    Robust reader for the sensor summary CSVs, used when the fast pandas C
+    parser chokes on a ragged file. Some exports have extra trailing columns
+    (e.g. WIFI RSSI stats) on some rows that were never added to the header
+    row -- those columns aren't tracked anywhere, so we just drop whatever is
+    beyond the header length instead of losing the whole row. Short rows are
+    padded with blanks (treated as missing, same as pandas would).
+    """
+    with open(file_path, newline='') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        n_cols = len(header)
+        rows = []
+        n_extra = 0
+        for row in reader:
+            if not row:
+                continue
+            if len(row) > n_cols:
+                n_extra += 1
+                row = row[:n_cols]
+            elif len(row) < n_cols:
+                row = row + [''] * (n_cols - len(row))
+            rows.append(row)
+    if n_extra:
+        print(f'Note: {os.path.basename(file_path)} had {n_extra} row(s) with extra trailing '
+              f'column(s) not present in the header (e.g. WIFI RSSI stats); those extra '
+              f'values were ignored, the rest of each row was kept.')
+    df = pd.DataFrame(rows, columns=header)
+    return df.replace('', np.nan)
 
 def ingest_metadata(dj):
     ingest_experimenters(dj)
@@ -727,7 +759,14 @@ def ingest_sensor_recordings(dj):
                   f'run ingest_sensor_placements first, skipping')
             continue
 
-        df = pd.read_csv(file_path)
+        try:
+            df = pd.read_csv(file_path)
+        except pd.errors.ParserError:
+            # sensor export files are occasionally ragged (e.g. extra trailing
+            # columns on some rows that were never added to the header) --
+            # rather than aborting ingestion, drop just the untracked extra
+            # columns and keep the rest of each row.
+            df = _read_sensor_summary_csv(file_path)
         df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
 
         # skip datetimes already ingested for this sensor
