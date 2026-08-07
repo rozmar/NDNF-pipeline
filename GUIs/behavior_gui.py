@@ -91,6 +91,155 @@ class PerfAxisControls(ttk.Frame):
         return window
 
 
+class EpochSelector(ttk.Frame):
+    """Checkboxes restricting the force histogram/trajectory (and force-vs-time) panels to
+    samples within selected trial epoch(s): quiescence, response, reward consumption.
+
+    All three checked (the default) is equivalent to no restriction at all.
+    """
+    EPOCHS = ('quiescence', 'response', 'reward')
+    LABELS = {'quiescence': 'Quiescence', 'response': 'Response', 'reward': 'Reward'}
+
+    def __init__(self, master, on_change, default_selected=EPOCHS):
+        super().__init__(master)
+        self.on_change = on_change
+        ttk.Label(self, text="Epochs:").pack(side="left")
+        self.vars = {}
+        for epoch in self.EPOCHS:
+            var = tk.BooleanVar(value=epoch in default_selected)
+            self.vars[epoch] = var
+            ttk.Checkbutton(self, text=self.LABELS[epoch], variable=var,
+                             command=self.on_change).pack(side="left", padx=(4, 0))
+
+    def get_selected_epochs(self):
+        return tuple(epoch for epoch in self.EPOCHS if self.vars[epoch].get())
+
+
+class TraceFilterControls(ttk.Frame):
+    """Dropdown + millisecond-based parameter entries to smooth each trial's force trace
+    before it feeds the histogram/trajectory/force-vs-time panels: none, boxcar (moving
+    average), median, gaussian, or Savitzky-Golay (a local polynomial fit -- keeps peak shape
+    better than the other three, at the cost of needing a window wide enough to fit the
+    chosen order).
+
+    Window/sigma are entered in milliseconds rather than samples, since the raw sample count
+    for a given duration depends on the (block-specific) force trace sampling rate; a gray
+    "(~N samples)" hint next to each entry shows what that currently works out to, updated via
+    set_sample_interval() whenever the selected block's sampling rate becomes known. Only the
+    parameter entry (entries) relevant to the selected method are enabled.
+    """
+    METHODS = ('none', 'boxcar', 'median', 'gaussian', 'savgol')
+    METHOD_LABELS = {
+        'none': 'None', 'boxcar': 'Boxcar (moving avg)', 'median': 'Median',
+        'gaussian': 'Gaussian', 'savgol': 'Savitzky-Golay',
+    }
+    RELEVANT_PARAMS = {
+        'none': (), 'boxcar': ('window',), 'median': ('window',),
+        'gaussian': ('sigma',), 'savgol': ('window', 'polyorder'),
+    }
+
+    def __init__(self, master, on_change):
+        super().__init__(master)
+        self.on_change = on_change
+        self._sample_interval_s = None  # seconds/sample for the currently selected block
+        ttk.Label(self, text="Trace filter:").pack(side="left")
+        self.method_var = tk.StringVar(value=self.METHOD_LABELS['none'])
+        self.method_cb = ttk.Combobox(self, textvariable=self.method_var, state="readonly", width=17,
+                                       values=[self.METHOD_LABELS[m] for m in self.METHODS])
+        self.method_cb.pack(side="left", padx=(4, 10))
+        self.method_cb.bind("<<ComboboxSelected>>", lambda e: self._on_method_changed())
+
+        ttk.Label(self, text="window (ms):").pack(side="left")
+        self.window_ms_var = tk.StringVar(value="50")
+        self.window_entry = ttk.Entry(self, textvariable=self.window_ms_var, width=6)
+        self.window_entry.pack(side="left", padx=(2, 2))
+        self.window_entry.bind("<Return>", lambda e: self._on_param_changed())
+        self.window_entry.bind("<FocusOut>", lambda e: self._on_param_changed())
+        self.window_hint_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.window_hint_var, foreground="gray").pack(side="left", padx=(0, 10))
+
+        ttk.Label(self, text="sigma (ms):").pack(side="left")
+        self.sigma_ms_var = tk.StringVar(value="20")
+        self.sigma_entry = ttk.Entry(self, textvariable=self.sigma_ms_var, width=6)
+        self.sigma_entry.pack(side="left", padx=(2, 2))
+        self.sigma_entry.bind("<Return>", lambda e: self._on_param_changed())
+        self.sigma_entry.bind("<FocusOut>", lambda e: self._on_param_changed())
+        self.sigma_hint_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.sigma_hint_var, foreground="gray").pack(side="left", padx=(0, 10))
+
+        ttk.Label(self, text="poly order:").pack(side="left")
+        self.polyorder_var = tk.StringVar(value="3")
+        self.polyorder_entry = ttk.Entry(self, textvariable=self.polyorder_var, width=4)
+        self.polyorder_entry.pack(side="left", padx=(2, 0))
+        self.polyorder_entry.bind("<Return>", lambda e: self.on_change())
+        self.polyorder_entry.bind("<FocusOut>", lambda e: self.on_change())
+
+        self._update_enabled_state()
+        self._update_hints()
+
+    def _method_key(self):
+        label = self.method_var.get()
+        for key, lbl in self.METHOD_LABELS.items():
+            if lbl == label:
+                return key
+        return 'none'
+
+    def _on_method_changed(self):
+        self._update_enabled_state()
+        self.on_change()
+
+    def _on_param_changed(self):
+        self._update_hints()
+        self.on_change()
+
+    def _update_enabled_state(self):
+        relevant = self.RELEVANT_PARAMS[self._method_key()]
+        self.window_entry.config(state="normal" if 'window' in relevant else "disabled")
+        self.sigma_entry.config(state="normal" if 'sigma' in relevant else "disabled")
+        self.polyorder_entry.config(state="normal" if 'polyorder' in relevant else "disabled")
+
+    def set_sample_interval(self, sample_interval_s):
+        """Called by the tab when the selected block's force-trace sampling rate becomes
+        known (or unknown, with None), so the "(~N samples)" hints stay accurate."""
+        self._sample_interval_s = sample_interval_s
+        self._update_hints()
+
+    def _update_hints(self):
+        window_ms = self._safe_float(self.window_ms_var, 50.0)
+        sigma_ms = self._safe_float(self.sigma_ms_var, 20.0)
+        if self._sample_interval_s:
+            # imported here (not at module load) so constructing this widget before a
+            # DataJoint connection exists never touches the ndnf_pipeline package -- see
+            # set_sample_interval(), which is the only caller that can make this branch true
+            from ndnf_pipeline.plot.behavior_plots import ms_to_samples, ms_to_samples_float
+            window_samples = ms_to_samples(window_ms, self._sample_interval_s)
+            sigma_samples = ms_to_samples_float(sigma_ms, self._sample_interval_s)
+            self.window_hint_var.set(f"(~{window_samples} samples)")
+            self.sigma_hint_var.set(f"(~{sigma_samples:.1f} samples)")
+        else:
+            self.window_hint_var.set("(rate unknown)")
+            self.sigma_hint_var.set("(rate unknown)")
+
+    def _safe_float(self, var, default):
+        try:
+            return float(var.get())
+        except ValueError:
+            var.set(str(default))
+            return default
+
+    def get_filter_kwargs(self):
+        method = self._method_key()
+        window_ms = self._safe_float(self.window_ms_var, 50.0)
+        sigma_ms = self._safe_float(self.sigma_ms_var, 20.0)
+        try:
+            polyorder = int(self.polyorder_var.get())
+        except ValueError:
+            polyorder = 3
+            self.polyorder_var.set(str(polyorder))
+        return dict(filter_method=method, filter_window_ms=window_ms, filter_sigma_ms=sigma_ms,
+                    filter_polyorder=polyorder)
+
+
 class PlotPanel(ttk.Frame):
     """A frame holding a matplotlib canvas + navigation toolbar; swap figures via show_figure()."""
 
@@ -134,11 +283,8 @@ class SessionOverviewTab(ttk.Frame):
         self.app = app
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=5, pady=5)
-        self.subtract_median = tk.BooleanVar(value=False)
-        ttk.Checkbutton(controls, text="Subtract force median", variable=self.subtract_median,
-                         command=self.refresh).pack(side="left")
         self.range_control = UniformRangeControl(controls, on_change=self.refresh)
-        self.range_control.pack(side="left", padx=(10, 0))
+        self.range_control.pack(side="left")
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
         self.perf_controls.pack(side="left", padx=(10, 0))
         ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
@@ -158,11 +304,12 @@ class SessionOverviewTab(ttk.Frame):
         def work():
             return plot_session_blocks_overview(
                 subject_id, session,
-                subtract_force_median=self.subtract_median.get(),
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
-                perf_smoothing_window=self.perf_controls.get_smoothing_window())
+                perf_smoothing_window=self.perf_controls.get_smoothing_window(),
+                epochs=self.app.epoch_selector.get_selected_epochs(),
+                **self.app.filter_controls.get_filter_kwargs())
 
         self.app.run_plot(work, self.panel)
 
@@ -185,9 +332,6 @@ class BlockDetailTab(ttk.Frame):
         self.block_cb = ttk.Combobox(controls, textvariable=self.block_var, state="readonly", width=8)
         self.block_cb.pack(side="left", padx=(4, 10))
         self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.on_block_selected())
-        self.subtract_median = tk.BooleanVar(value=True)
-        ttk.Checkbutton(controls, text="Subtract force median", variable=self.subtract_median,
-                         command=self.refresh).pack(side="left")
         self.range_control = UniformRangeControl(controls, on_change=self.refresh)
         self.range_control.pack(side="left", padx=(10, 0))
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
@@ -224,6 +368,7 @@ class BlockDetailTab(ttk.Frame):
         if subject_id is None or session is None:
             self.trial_listbox.delete(0, "end")
             self.panel.clear()
+            self.app.update_shared_sample_interval()
             return
         try:
             blocks = sorted((self.app.experiment.Block()
@@ -239,9 +384,11 @@ class BlockDetailTab(ttk.Frame):
         else:
             self.trial_listbox.delete(0, "end")
             self.panel.clear()
+            self.app.update_shared_sample_interval()
 
     def on_block_selected(self):
         self.reload_trials()
+        self.app.update_shared_sample_interval()
         self.refresh()
 
     def reload_trials(self):
@@ -282,12 +429,13 @@ class BlockDetailTab(ttk.Frame):
         def work():
             return plot_block_force_figure(
                 subject_id, session, block,
-                subtract_force_median=self.subtract_median.get(),
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
                 perf_smoothing_window=self.perf_controls.get_smoothing_window(),
-                trials=selected_trials or None)
+                trials=selected_trials or None,
+                epochs=self.app.epoch_selector.get_selected_epochs(),
+                **self.app.filter_controls.get_filter_kwargs())
 
         self.app.run_plot(work, self.panel)
 
@@ -879,6 +1027,7 @@ class BehaviorGUI(tk.Tk):
 
         self._build_menu()
         self._build_top_bar()
+        self._build_shared_force_controls()
         self._build_tabs()
         self._build_status_bar()
 
@@ -909,6 +1058,57 @@ class BehaviorGUI(tk.Tk):
         self.session_cb = ttk.Combobox(bar, textvariable=self.session_var, state="readonly", width=28)
         self.session_cb.pack(side="left", padx=(4, 16))
         self.session_cb.bind("<<ComboboxSelected>>", lambda e: self.on_session_selected())
+
+    def _build_shared_force_controls(self):
+        """Epoch selection and trace filtering apply to force data, not to a specific tab, so
+        one shared instance of each lives here (above the tab notebook) and is read by both
+        Session Overview and Block Detail -- changing either is immediately reflected in both,
+        rather than each tab tracking its own, independently-driftable copy."""
+        row = ttk.Frame(self)
+        row.pack(fill="x", padx=8, pady=(0, 4))
+        self.epoch_selector = EpochSelector(row, on_change=self._on_shared_force_controls_changed)
+        self.epoch_selector.pack(side="left")
+        row2 = ttk.Frame(self)
+        row2.pack(fill="x", padx=8, pady=(0, 6))
+        self.filter_controls = TraceFilterControls(row2, on_change=self._on_shared_force_controls_changed)
+        self.filter_controls.pack(side="left")
+
+    def _on_shared_force_controls_changed(self):
+        self.session_overview_tab.refresh()
+        self.block_detail_tab.refresh()
+
+    def update_shared_sample_interval(self):
+        """Refresh the shared filter controls' "(~N samples)" hints for whichever block is
+        current: Block Detail's own selection if it has one, else the session's first block
+        (so the hint is still useful from the Session Overview tab, which has no single
+        block of its own)."""
+        subject_id, session = self.get_selected_subject_session()
+        if subject_id is None or session is None:
+            self.filter_controls.set_sample_interval(None)
+            return
+        block_str = self.block_detail_tab.block_var.get()
+        if block_str:
+            block = int(block_str)
+        else:
+            try:
+                blocks = sorted((self.experiment.Block()
+                                  & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+            except Exception as exc:
+                self.report_error(exc)
+                self.filter_controls.set_sample_interval(None)
+                return
+            block = blocks[0] if blocks else None
+        if block is None:
+            self.filter_controls.set_sample_interval(None)
+            return
+        from ndnf_pipeline.plot.behavior_plots import estimate_force_sample_interval
+
+        try:
+            sample_interval_s = estimate_force_sample_interval(subject_id, session, block)
+        except Exception as exc:
+            self.report_error(exc)
+            sample_interval_s = None
+        self.filter_controls.set_sample_interval(sample_interval_s)
 
     def _build_tabs(self):
         self.notebook = ttk.Notebook(self)
