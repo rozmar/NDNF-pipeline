@@ -4,8 +4,12 @@ import matplotlib.cm as cm
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import numpy as np
+from scipy.ndimage import uniform_filter1d, median_filter, gaussian_filter1d
+from scipy.signal import savgol_filter
 
 DEFAULT_UNIFORM_FORCE_RANGE = np.asarray([-1, 1, -1, 1]) * 10
+ALL_EPOCHS = ('quiescence', 'response', 'reward')
+FILTER_METHODS = ('none', 'boxcar', 'median', 'gaussian', 'savgol')
 
 
 def _get_block_force_axes(experiment, subject_id, session, task_setting_id):
@@ -47,11 +51,98 @@ def _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_si
     return lr_traces, pa_traces
 
 
+def _filter_trace(values, method, window=5, sigma=2.0, polyorder=3):
+    """Smooth one trial's 1D trace with the given method ('none'/'boxcar'/'median'/'gaussian'/
+    'savgol'); 'nearest'-padded at the edges so the output stays the same length as the input.
+
+    boxcar/median/savgol take `window` (samples, forced odd where the underlying filter
+    requires it); gaussian takes `sigma` (samples); savgol additionally takes `polyorder`
+    (capped below `window` so it stays fittable, and below the trace length for short trials).
+    """
+    values = np.asarray(values, dtype=float)
+    if not method or method == 'none' or values.size == 0:
+        return values
+    if method == 'boxcar':
+        return uniform_filter1d(values, size=max(1, int(window)), mode='nearest')
+    if method == 'median':
+        size = max(1, int(window))
+        if size % 2 == 0:
+            size += 1
+        return median_filter(values, size=size, mode='nearest')
+    if method == 'gaussian':
+        return gaussian_filter1d(values, sigma=max(1e-6, float(sigma)), mode='nearest')
+    if method == 'savgol':
+        size = max(3, int(window))
+        if size % 2 == 0:
+            size += 1
+        if size > values.size:
+            size = values.size if values.size % 2 == 1 else values.size - 1
+        if size < 3:
+            return values  # trial too short to fit a polynomial window meaningfully
+        order = min(max(0, int(polyorder)), size - 1)
+        return savgol_filter(values, window_length=size, polyorder=order, mode='nearest')
+    raise ValueError(f"unknown filter method: {method!r}")
+
+
+def _filter_traces(lr_traces, pa_traces, method, **filter_params):
+    """Apply _filter_trace to every trial's lr/pa trace; a no-op when method is 'none'/None."""
+    if not method or method == 'none':
+        return lr_traces, pa_traces
+    filtered_lr = [_filter_trace(t, method, **filter_params) for t in lr_traces]
+    filtered_pa = [_filter_trace(t, method, **filter_params) for t in pa_traces]
+    return filtered_lr, filtered_pa
+
+
+def _estimate_sample_interval(times_list):
+    """Median force-trace sample interval (seconds), pooling sample-to-sample diffs across
+    every trial's force_trace_time array. None if there isn't enough data to tell (e.g. every
+    trial has 0 or 1 samples)."""
+    diffs = [np.diff(np.asarray(t, float)) for t in times_list if len(t) > 1]
+    if not diffs:
+        return None
+    return float(np.median(np.concatenate(diffs)))
+
+
+def ms_to_samples(duration_ms, sample_interval_s, minimum=1):
+    """Convert a duration in milliseconds to an integer number of samples, given the sample
+    interval in seconds. Falls back to `minimum` if the sample interval isn't known (None/<=0)."""
+    if not sample_interval_s or sample_interval_s <= 0:
+        return minimum
+    return max(minimum, int(round(duration_ms / 1000.0 / sample_interval_s)))
+
+
+def ms_to_samples_float(duration_ms, sample_interval_s, minimum=1e-6):
+    """Like ms_to_samples, but keeps a fractional sample count (for e.g. Gaussian sigma, which
+    doesn't need to be an integer)."""
+    if not sample_interval_s or sample_interval_s <= 0:
+        return minimum
+    return max(minimum, duration_ms / 1000.0 / sample_interval_s)
+
+
+def estimate_force_sample_interval(subject_id, session, block):
+    """Median force-trace sample interval (seconds) for one block, estimated from a single
+    trial's timestamps. Cheap enough to call live from a GUI (e.g. to preview how many samples
+    a millisecond-based filter parameter works out to) without building a full figure. Returns
+    None if the block has no force trace yet.
+    """
+    from ndnf_pipeline import experiment
+
+    times = (experiment.TrialForceTrace() * experiment.BehaviorTrial()
+             & {'subject_id': subject_id, 'session': session, 'block': block}).fetch('force_trace_time', limit=1)
+    if len(times) == 0:
+        return None
+    t = np.asarray(times[0], float)
+    return float(np.median(np.diff(t))) if t.size > 1 else None
+
+
 def _force_histogram(lr_traces, pa_traces, histrange, bins=50):
     # log-density 2D histogram of force, with -inf (empty bins) clipped to the finite minimum
     try:
+        lr_cat = np.concatenate(lr_traces)
+        pa_cat = np.concatenate(pa_traces)
+        valid = ~(np.isnan(lr_cat) | np.isnan(pa_cat))  # epoch-filtered traces carry NaN gaps
         forcehist, binx, biny = np.histogram2d(
-            np.concatenate(lr_traces), np.concatenate(pa_traces),
+            lr_cat[valid], pa_cat[valid],
             range=histrange, bins=bins)
         forcehist = np.log(forcehist / forcehist.sum())
         forcehist_ = forcehist.copy()
@@ -130,6 +221,87 @@ def _fetch_quiescence_response(experiment, key):
     return np.array(trials), np.array(quiescence_value), np.array(response_value)
 
 
+def _event_time_by_trial(experiment, key, event_type):
+    """{trial: trial_event_time} for every trial in a block that has this event type."""
+    ev_trial, ev_time = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
+                          & {**key, 'trial_event_type': event_type}).fetch('trial', 'trial_event_time')
+    return dict(zip(ev_trial.tolist(), np.asarray(ev_time, float)))
+
+
+def _epoch_windows_from_events(go_by_trial, threshold_by_trial, reward_by_trial,
+                                trial_nums, trial_starts, trial_ends):
+    """Per-trial (quiescence, response, reward) time windows, relative to trial start.
+
+    quiescence = trial start -> 'go' event; response = 'go' -> 'threshold crossing' (falling
+    back to trial end if the trial has no threshold crossing, e.g. a miss); reward =
+    'reward' event (falling back to 'threshold crossing') -> trial end. A trial missing the
+    event(s) an epoch depends on simply has no entry for that epoch.
+
+    Returns {trial: {epoch_name: (start, end)}}.
+    """
+    windows = {}
+    for trial, start, end in zip(trial_nums, np.asarray(trial_starts, float), np.asarray(trial_ends, float)):
+        trial = int(trial)
+        duration = end - start
+        window = {}
+        go_t = go_by_trial.get(trial)
+        threshold_t = threshold_by_trial.get(trial)
+        reward_t = reward_by_trial.get(trial)
+        if go_t is not None:
+            window['quiescence'] = (0.0, go_t)
+            window['response'] = (go_t, threshold_t if threshold_t is not None else duration)
+        reward_start = reward_t if reward_t is not None else threshold_t
+        if reward_start is not None:
+            window['reward'] = (reward_start, duration)
+        windows[trial] = window
+    return windows
+
+
+def _fetch_epoch_windows(experiment, key):
+    """_epoch_windows_from_events, fetching its inputs itself for every trial in a block/session key."""
+    go_by_trial = _event_time_by_trial(experiment, key, 'go')
+    threshold_by_trial = _event_time_by_trial(experiment, key, 'threshold crossing')
+    reward_by_trial = _event_time_by_trial(experiment, key, 'reward')
+    trial_nums, trial_starts, trial_ends = (experiment.SessionTrial() * experiment.BehaviorTrial() * experiment.Block()
+                                             & key).fetch('trial', 'trial_start_time', 'trial_end_time')
+    return _epoch_windows_from_events(go_by_trial, threshold_by_trial, reward_by_trial,
+                                       trial_nums, trial_starts, trial_ends)
+
+
+def _mask_trace_by_epochs(times, values, window, epochs):
+    """Blank out (set to NaN) samples of `values` that fall outside every requested epoch.
+
+    `times`/`values` are one trial's samples (relative to trial start); `window` is that
+    trial's dict from _fetch_epoch_windows (missing epochs contribute nothing, so a trial
+    lacking e.g. a reward event is fully excluded when only 'reward' is requested).
+    """
+    times = np.asarray(times, float)
+    values = np.array(values, dtype=float, copy=True)
+    mask = np.zeros(times.shape, dtype=bool)
+    for epoch in epochs:
+        window_range = window.get(epoch)
+        if window_range is None:
+            continue
+        lo, hi = window_range
+        mask |= (times >= lo) & (times <= hi)
+    values[~mask] = np.nan
+    return values
+
+
+def _filter_traces_by_epochs(trial_nums, times_list, lr_traces, pa_traces, windows, epochs):
+    """Apply _mask_trace_by_epochs to every trial's lr/pa trace, unless epochs is None/empty
+    or already covers every epoch (in which case nothing is filtered, for cheap backward
+    compatibility with 'show everything')."""
+    if not epochs or set(epochs) >= set(ALL_EPOCHS):
+        return lr_traces, pa_traces
+    filtered_lr, filtered_pa = [], []
+    for trial, times, lr, pa in zip(trial_nums, times_list, lr_traces, pa_traces):
+        window = windows.get(int(trial), {})
+        filtered_lr.append(_mask_trace_by_epochs(times, lr, window, epochs))
+        filtered_pa.append(_mask_trace_by_epochs(times, pa, window, epochs))
+    return filtered_lr, filtered_pa
+
+
 def _plot_quiescence_response(ax, trials, quiescence_value, response_value, color,
                                smoothing_window=10, log_yscale=False, label=None):
     """Plot quiescence ('^') and response ('.') durations per trial, plus rolling means, on ax."""
@@ -157,10 +329,12 @@ def _add_quiescence_response_marker_legend(ax, smoothing_window, bbox_to_anchor,
     ax.legend(handles=handles, loc=loc, bbox_to_anchor=bbox_to_anchor, fontsize=7, ncol=ncol)
 
 
-def plot_block_force_figure(subject_id, session, block, subtract_force_median=True,
+def plot_block_force_figure(subject_id, session, block,
                              force_uniform_range=True, uniform_force_range=None,
                              perf_log_yscale=False, perf_smoothing_window=10,
-                             trials=None, fig_dir=None):
+                             trials=None, epochs=None,
+                             filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
+                             filter_polyorder=3, fig_dir=None):
     """6-panel figure for one block: target LUT, performance, force distribution, force
     trajectories (spatial), lickport position vs. time, and force vs. time.
 
@@ -171,6 +345,19 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     trial in the block. If trials is given, the force distribution, spatial trajectory,
     lickport, and force-vs-time panels are restricted to just those trial numbers;
     otherwise they use every trial in the block.
+
+    epochs restricts the force distribution, spatial trajectory, and force-vs-time panels
+    to samples falling within the given trial epoch(s): any subset of ('quiescence',
+    'response', 'reward'). None (or a set covering all three) means no restriction.
+
+    filter_method smooths each trial's force trace (per-trial, before the epoch restriction
+    above) with one of FILTER_METHODS: None/'none' (no filtering), 'boxcar' (moving average,
+    `filter_window_ms`), 'median' (`filter_window_ms`), 'gaussian' (`filter_sigma_ms`), or
+    'savgol' (Savitzky-Golay polynomial fit, `filter_window_ms` and `filter_polyorder`).
+    `filter_window_ms`/`filter_sigma_ms` are converted to samples using this block's own force
+    trace sample interval (so they mean the same thing regardless of sampling rate). Filtering
+    feeds every downstream panel that uses the force traces (distribution, trajectory,
+    force-vs-time).
 
     If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_b{block}.png'.
     Returns the figure.
@@ -188,6 +375,20 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     task_setting_id, target_force_lut = (experiment.TaskSettings() * experiment.Block() & key).fetch1('task_setting_id', 'target_force_lut')
     force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, session, task_setting_id)
     lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+
+    # period boundaries for every trial in the block (not just the plotted trials), used both to
+    # shade the lickport/force-vs-time panels below and (via _epoch_windows_from_events) to
+    # restrict the histogram/trajectory/force-vs-time panels to the requested epoch(s); 'go' marks
+    # the end of quiescence/start of response, 'reward' (falling back to 'threshold crossing' if
+    # this trial has no separate reward event) marks reward delivery
+    go_by_trial = _event_time_by_trial(experiment, key, 'go')
+    threshold_by_trial = _event_time_by_trial(experiment, key, 'threshold crossing')
+    reward_by_trial = _event_time_by_trial(experiment, key, 'reward')
+    all_trial_nums, all_trial_starts, all_trial_ends = (
+        experiment.SessionTrial() * experiment.BehaviorTrial() * experiment.Block() & key
+    ).fetch('trial', 'trial_start_time', 'trial_end_time')
+    epoch_windows = _epoch_windows_from_events(go_by_trial, threshold_by_trial, reward_by_trial,
+                                                all_trial_nums, all_trial_starts, all_trial_ends)
 
     fig = plt.figure(figsize=(12, 19))
     gs = plt.GridSpec(4, 2, figure=fig, height_ratios=[1, 1, 0.6, 0.8], hspace=0.45, wspace=0.3)
@@ -218,26 +419,30 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     _add_quiescence_response_marker_legend(ax_performance, perf_smoothing_window, bbox_to_anchor=(1.0, -0.2))
 
     ax_force_hist = fig.add_subplot(gs[0, 1])
-    force_traces_0_query = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
-                             & {**key, 'force_axis_idx': 0})
+    force_traces_0_query = (experiment.TrialForceTrace() * experiment.TrialForceTrace.TrialForceAxis()
+                             * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0})
     force_traces_1_query = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
                              & {**key, 'force_axis_idx': 1})
     if trials:
         trial_restriction = [{'trial': int(t)} for t in trials]
         force_traces_0_query = force_traces_0_query & trial_restriction
         force_traces_1_query = force_traces_1_query & trial_restriction
-    force_trials, force_traces_0_ = force_traces_0_query.fetch('trial', 'force_trace_value', order_by='trial')
+    force_trials, force_trace_times, force_traces_0_ = force_traces_0_query.fetch(
+        'trial', 'force_trace_time', 'force_trace_value', order_by='trial')
     _, force_traces_1_ = force_traces_1_query.fetch('trial', 'force_trace_value', order_by='trial')
-    if subtract_force_median:
-        f0_baseline = np.median(np.concatenate(force_traces_0_))
-        f1_baseline = np.median(np.concatenate(force_traces_1_))
-        force_traces_0 = [f - f0_baseline for f in force_traces_0_]
-        force_traces_1 = [f - f1_baseline for f in force_traces_1_]
-    else:
-        force_traces_0 = list(force_traces_0_)
-        force_traces_1 = list(force_traces_1_)
+    f0_baseline = np.median(np.concatenate(force_traces_0_))
+    f1_baseline = np.median(np.concatenate(force_traces_1_))
+    force_traces_0 = [f - f0_baseline for f in force_traces_0_]
+    force_traces_1 = [f - f1_baseline for f in force_traces_1_]
 
     lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
+    sample_interval_s = _estimate_sample_interval(force_trace_times)
+    filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
+    filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
+    lr_traces, pa_traces = _filter_traces(lr_traces, pa_traces, filter_method, window=filter_window,
+                                           sigma=filter_sigma, polyorder=filter_polyorder)
+    lr_traces, pa_traces = _filter_traces_by_epochs(force_trials, force_trace_times, lr_traces, pa_traces,
+                                                     epoch_windows, epochs)
 
     histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
     forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
@@ -265,17 +470,7 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     trial_start_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_starts, float)))
     trial_end_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_ends, float)))
 
-    # period boundaries, fetched for the whole block (not just the plotted trials) and looked
-    # up per trial below; 'go' marks the end of quiescence/start of response, 'reward' (falling
-    # back to 'threshold crossing' if this trial has no separate reward event) marks reward delivery
-    def _event_time_by_trial(event_type):
-        ev_trial, ev_time = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
-                              & {**key, 'trial_event_type': event_type}).fetch('trial', 'trial_event_time')
-        return dict(zip(ev_trial.tolist(), np.asarray(ev_time, float)))
-
-    go_by_trial = _event_time_by_trial('go')
-    threshold_by_trial = _event_time_by_trial('threshold crossing')
-    reward_by_trial = _event_time_by_trial('reward')
+    # go_by_trial/threshold_by_trial/reward_by_trial were already fetched above (for epoch_windows)
 
     def _shade_trial_periods(ax, trial, trial_start, trial_end):
         go_t = go_by_trial.get(trial)
@@ -371,9 +566,12 @@ def plot_block_force_figure(subject_id, session, block, subtract_force_median=Tr
     return fig
 
 
-def plot_session_blocks_overview(subject_id, session, subtract_force_median=True,
+def plot_session_blocks_overview(subject_id, session,
                                   force_uniform_range=True, uniform_force_range=None,
-                                  perf_log_yscale=False, perf_smoothing_window=10, fig_dir=None):
+                                  perf_log_yscale=False, perf_smoothing_window=10,
+                                  epochs=None,
+                                  filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
+                                  filter_polyorder=3, fig_dir=None):
     """Session-level overview across all of a session's blocks.
 
     Row 1: for every rewarded trial in the session (one panel), the quiescence duration
@@ -386,6 +584,17 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
     Row 4: each block's force trajectories (early=blue, late=red), side by side.
 
     X is always Left-Right (L<0, R>0) and Y is always Posterior-Anterior (P<0, A>0).
+
+    epochs restricts rows 3 and 4 (histogram, trajectories) to samples falling within the
+    given trial epoch(s): any subset of ('quiescence', 'response', 'reward'). None (or a
+    set covering all three) means no restriction.
+
+    filter_method smooths each trial's force trace (per-trial, per-block, before the epoch
+    restriction above) with one of FILTER_METHODS: None/'none' (no filtering), 'boxcar'
+    (moving average, `filter_window_ms`), 'median' (`filter_window_ms`), 'gaussian'
+    (`filter_sigma_ms`), or 'savgol' (Savitzky-Golay polynomial fit, `filter_window_ms` and
+    `filter_polyorder`). `filter_window_ms`/`filter_sigma_ms` are converted to samples using
+    each block's own force trace sample interval.
 
     If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_blocks_overview.png'.
     Returns the figure.
@@ -408,17 +617,25 @@ def plot_session_blocks_overview(subject_id, session, subtract_force_median=True
         force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, session, task_setting_id)
         lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
 
-        force_traces_0_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0}).fetch('force_trace_value')
-        force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 1}).fetch('force_trace_value')
-        if subtract_force_median:
-            f0_baseline = np.median(np.concatenate(force_traces_0_))
-            f1_baseline = np.median(np.concatenate(force_traces_1_))
-            force_traces_0 = [f - f0_baseline for f in force_traces_0_]
-            force_traces_1 = [f - f1_baseline for f in force_traces_1_]
-        else:
-            force_traces_0 = list(force_traces_0_)
-            force_traces_1 = list(force_traces_1_)
+        force_traces_0_query = (experiment.TrialForceTrace() * experiment.TrialForceTrace.TrialForceAxis()
+                                 * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0})
+        force_trials, force_trace_times, force_traces_0_ = force_traces_0_query.fetch(
+            'trial', 'force_trace_time', 'force_trace_value', order_by='trial')
+        force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
+                            & {**key, 'force_axis_idx': 1}).fetch('force_trace_value', order_by='trial')
+        f0_baseline = np.median(np.concatenate(force_traces_0_))
+        f1_baseline = np.median(np.concatenate(force_traces_1_))
+        force_traces_0 = [f - f0_baseline for f in force_traces_0_]
+        force_traces_1 = [f - f1_baseline for f in force_traces_1_]
         lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
+        sample_interval_s = _estimate_sample_interval(force_trace_times)
+        filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
+        filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
+        lr_traces, pa_traces = _filter_traces(lr_traces, pa_traces, filter_method, window=filter_window,
+                                               sigma=filter_sigma, polyorder=filter_polyorder)
+        epoch_windows = _fetch_epoch_windows(experiment, key)
+        lr_traces, pa_traces = _filter_traces_by_epochs(force_trials, force_trace_times, lr_traces, pa_traces,
+                                                         epoch_windows, epochs)
 
         histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
         forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
