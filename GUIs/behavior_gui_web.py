@@ -619,6 +619,9 @@ class VideoGenerationTab:
         self.use_camera_2 = pn.widgets.Checkbox(name="Add a 2nd camera (stacked below camera 1)", value=False)
         self.camera_2_select = pn.widgets.Select(name="Camera 2", options=[], width=180, disabled=True)
         self.use_camera_2.param.watch(lambda e: self._on_camera2_toggle(), "value")
+        self.camera_select.param.watch(self._update_default_filename, "value")
+        self.camera_2_select.param.watch(self._update_default_filename, "value")
+        self.use_camera_2.param.watch(self._update_default_filename, "value")
         cameras_row = pn.Row(self.camera_select, self.use_camera_2, self.camera_2_select)
 
         self.pad_start = pn.widgets.FloatInput(name="pad start (s)", value=1.0, width=90)
@@ -671,8 +674,9 @@ class VideoGenerationTab:
 
         self.output_dir_input = pn.widgets.TextInput(name="Output folder", width=340)
         cfg = dj_connection.load_gui_config()
-        self.output_dir_input.value = cfg.get("video_output_dir") or str(Path.home())
+        self.output_dir_input.value = cfg.get("video_output_dir") or "/home/coder/project/Videos"
         self.output_name_input = pn.widgets.TextInput(name="Output filename", value="video.mp4", width=260)
+        self._last_auto_name = self.output_name_input.value
 
         self.render_btn = pn.widgets.Button(name="Render video", button_type="primary", width=120)
         self.render_btn.on_click(lambda e: self.start_render())
@@ -730,6 +734,7 @@ class VideoGenerationTab:
         block_str = self.app.block_detail_tab.block_select.value
         if subject_id is None or session is None or not block_str:
             self.inherited_label.object = "*(switch to the Block Detail tab and pick a block first)*"
+            self._update_default_filename()
             return
         try:
             all_trials = sorted((self.app.experiment.BehaviorTrial()
@@ -740,11 +745,13 @@ class VideoGenerationTab:
             return
         if not all_trials:
             self.inherited_label.object = f"Block {block_str}: no trials in this block"
+            self._update_default_filename()
             return
         selected = self.app.block_detail_tab.get_selected_trials()
         chosen = sorted(t for t in selected if t in all_trials) if selected else all_trials
         if not chosen:
             self.inherited_label.object = f"Block {block_str}: the selected trials aren't in this block"
+            self._update_default_filename()
             return
         self._inherited_block = int(block_str)
         self._inherited_trial_start = all_trials.index(min(chosen))
@@ -755,6 +762,28 @@ class VideoGenerationTab:
         else:
             self.inherited_label.object = (f"Block {block_str}: all {len(all_trials)} trials "
                                             f"(trial numbers {all_trials[0]}-{all_trials[-1]})")
+        self._update_default_filename()
+
+    def _compute_default_filename(self):
+        """Mirrors Tkinter's choose_output_path() default-name logic."""
+        subject_id, session = self.app.get_selected_subject_session()
+        camera = self.camera_select.value
+        camera_suffix = camera
+        if self.use_camera_2.value and self.camera_2_select.value:
+            camera_suffix = f"{camera}+{self.camera_2_select.value}"
+        if subject_id and session is not None and self._inherited_block is not None and camera:
+            return (f"{subject_id}_s{session}_b{self._inherited_block}_"
+                    f"t{self._inherited_trial_start}-{self._inherited_trial_end}_{camera_suffix}.mp4")
+        return "video.mp4"
+
+    def _update_default_filename(self, *_):
+        """Keep the filename field auto-populated as block/trial/camera selection changes,
+        without clobbering a name the user has deliberately typed in themselves - only
+        overwrite it if it still matches the last value *we* auto-generated."""
+        new_name = self._compute_default_filename()
+        if self.output_name_input.value == self._last_auto_name:
+            self.output_name_input.value = new_name
+        self._last_auto_name = new_name
 
     # --- widget value parsing ---
     def _current_params(self):

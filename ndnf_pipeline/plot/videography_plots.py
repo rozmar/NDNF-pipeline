@@ -21,6 +21,32 @@ _LABELS = {
 }
 
 
+def _resolve_case_insensitive(root, relative_path):
+    """Resolve `relative_path` under `root`, tolerating per-segment case mismatches.
+
+    file_path values are written by Windows/Mac acquisition machines, whose filesystems are
+    case-insensitive, so a stored segment like 'behavior' happily refers to a real folder
+    named 'Behavior' there. Linux is case-sensitive, so the exact-case join silently resolves
+    to a nonexistent path. Falls back to the naive join (so a genuinely-missing file still
+    surfaces a normal "not found" rather than a confusing one) when no case-insensitive match
+    exists at some segment.
+    """
+    current = root
+    for part in relative_path.split('/'):
+        if not part:
+            continue
+        exact = os.path.join(current, part)
+        if os.path.exists(exact):
+            current = exact
+            continue
+        try:
+            match = next(e for e in os.listdir(current) if e.lower() == part.lower())
+        except (OSError, StopIteration):
+            return os.path.join(root, relative_path)
+        current = os.path.join(current, match)
+    return current
+
+
 def _camera_video_file(videography, dj, key, camera_name, trials_needed):
     """Resolve a camera's raw video file path + its full per-file frame_times array.
 
@@ -36,7 +62,12 @@ def _camera_video_file(videography, dj, key, camera_name, trials_needed):
         current_file_idx = tv_query.fetch1('video_file_idx')
         vf = (videography.VideoFile() & key & {'device': camera_name,
                                                 'video_file_idx': current_file_idx}).fetch1()
-        video_file_path = os.path.join(dj.config['path.raw_data'], vf['file_path'])
+        # file_path is recorded with Windows-style backslashes by the acquisition machine;
+        # os.path.join/os.path.exists don't treat '\' as a separator on Linux/Mac, so without
+        # this the whole thing silently glues into one nonexistent filename with literal
+        # backslashes in it (cv2.VideoCapture then just fails to open, with no clear error)
+        relative_path = vf['file_path'].replace('\\', '/')
+        video_file_path = _resolve_case_insensitive(dj.config['path.raw_data'], relative_path)
         break
 
     if current_file_idx is None:
@@ -375,6 +406,25 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
     return fig
 
 
+def _read_last_frame(video_file_path, frame_index):
+    """Open video_file_path, seek to frame_index, and read it.
+
+    Raises a clear, file-naming error instead of letting a failed seek/read (wrong or missing
+    file, corrupt file, frame index past the end, ...) surface later as OpenCV's cryptic
+    "cvtColor: !_src.empty()" assertion.
+    """
+    cap = cv2.VideoCapture(video_file_path)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open video file: {video_file_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError(f"Could not read frame {frame_index} from video file: {video_file_path}")
+    return frame
+
+
 def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en', crop_2=None):
     """Preview figure for the last frame of the video window; also returns the raw frame(s) and
     clims (each camera's own brightness scaling, computed independently, since two different
@@ -385,20 +435,13 @@ def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=
     last_frame_2 with its own clims_2 (both None otherwise); crop_2 only matters when a second
     camera is present.
     """
-    cap = cv2.VideoCapture(data['video_file_path'])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(data['frame_abs_indices'][-1]))
-    ret, last_frame = cap.read()
-    cap.release()
-
+    last_frame = _read_last_frame(data['video_file_path'], data['frame_abs_indices'][-1])
     gray  = cv2.cvtColor(last_frame, cv2.COLOR_BGR2GRAY)
     clims = np.percentile(gray.flatten(), list(clim_pct))
 
     last_frame_2, clims_2 = None, None
     if data.get('camera_name_2'):
-        cap2 = cv2.VideoCapture(data['video_file_path_2'])
-        cap2.set(cv2.CAP_PROP_POS_FRAMES, int(data['frame_abs_indices_2'][-1]))
-        ret2, last_frame_2 = cap2.read()
-        cap2.release()
+        last_frame_2 = _read_last_frame(data['video_file_path_2'], data['frame_abs_indices_2'][-1])
         gray_2 = cv2.cvtColor(last_frame_2, cv2.COLOR_BGR2GRAY)
         clims_2 = np.percentile(gray_2.flatten(), list(clim_pct))
 
@@ -421,19 +464,13 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     two different physical cameras rarely share the same brightness distribution.
     """
     if clims is None:
-        cap = cv2.VideoCapture(data['video_file_path'])
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(data['frame_abs_indices'][-1]))
-        ret, last_frame = cap.read()
-        cap.release()
+        last_frame = _read_last_frame(data['video_file_path'], data['frame_abs_indices'][-1])
         gray = cv2.cvtColor(last_frame, cv2.COLOR_BGR2GRAY)
         clims = np.percentile(gray.flatten(), list(clim_pct))
 
     has_cam2 = bool(data.get('camera_name_2'))
     if has_cam2 and clims_2 is None:
-        cap2_probe = cv2.VideoCapture(data['video_file_path_2'])
-        cap2_probe.set(cv2.CAP_PROP_POS_FRAMES, int(data['frame_abs_indices_2'][-1]))
-        ret2, last_frame_2 = cap2_probe.read()
-        cap2_probe.release()
+        last_frame_2 = _read_last_frame(data['video_file_path_2'], data['frame_abs_indices_2'][-1])
         gray_2 = cv2.cvtColor(last_frame_2, cv2.COLOR_BGR2GRAY)
         clims_2 = np.percentile(gray_2.flatten(), list(clim_pct))
 
