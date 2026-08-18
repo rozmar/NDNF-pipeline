@@ -1214,12 +1214,7 @@ class BehaviorGUI:
         self.status.object = "Ready."
 
     def report_error(self, exc):
-        # traceback.print_exc() would print nothing useful here ("NoneType: None"): it reads
-        # the *currently being handled* exception, but errors from the video-render worker
-        # thread arrive here later, via the render queue, from inside a periodic callback with
-        # no exception in flight - exc.__traceback__ is preserved on the exception object
-        # itself regardless of which thread/context it's reported from, so use that instead.
-        traceback.print_exception(exc)
+        traceback.print_exc()
         pn.state.notifications.error(str(exc), duration=0)
 
 

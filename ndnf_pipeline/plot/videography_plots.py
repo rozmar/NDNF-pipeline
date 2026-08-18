@@ -19,11 +19,13 @@ _LABELS = {
                fb_start='start', fb_target='target',
                force_x='Left - Right (g)',
                force_y='Posterior - Anterior (g)',
+               force_time='Force (g)', lr_label='Left - Right', pa_label='Posterior - Anterior',
                lbl_target='Target', lbl_current='Current'),
     'hu': dict(time='Idő (mp)', feedback='Visszajelzés',
                fb_start='start', fb_target='cél',
                force_x='Bal - Jobb erő (g)',
                force_y='Hátsó - Elülső erő (g)',
+               force_time='Erő (g)', lr_label='Bal - Jobb', pa_label='Hátsó - Elülső',
                lbl_target='Cél', lbl_current='Aktuális'),
 }
 
@@ -303,38 +305,45 @@ class _VideoFrameArtists:
         h, w = video_frame.shape[:2]
         h_crop = h - ct - (cb if cb else 0)
         w_crop = w - cl - (cr if cr else 0)
-        # the camera-image column keeps a fixed width regardless of camera count, so each camera
-        # image is always the same size; a second stacked image makes the figure taller, and the
-        # right column's width is scaled up by that same factor so its own aspect ratio (and the
+        # the camera image(s) sit in a fixed-width column so each image is always the same size
+        # regardless of camera count; a second stacked image makes the figure taller, and the
+        # other column's width is scaled up by that same factor so its own aspect ratio (and the
         # target/current force squares within it) doesn't get squeezed narrow by the extra height
-        left_col_w = 7.5
-        fig_h_1cam = max(left_col_w * h_crop / w_crop, 7)
+        img_col_w = 7.5
+        fig_h_1cam = max(img_col_w * h_crop / w_crop, 7)
 
         if has_cam2:
             h2, w2 = video_frame_2.shape[:2]
             cl2, cr2, ct2, cb2 = self.crop_2
             h_crop2 = h2 - ct2 - (cb2 if cb2 else 0)
             w_crop2 = w2 - cl2 - (cr2 if cr2 else 0)
-            fig_h = max(left_col_w * h_crop / w_crop + left_col_w * h_crop2 / w_crop2, 7)
-            right_col_w = left_col_w * (fig_h / fig_h_1cam)
+            fig_h = max(img_col_w * h_crop / w_crop + img_col_w * h_crop2 / w_crop2, 7)
+            other_col_w = img_col_w * (fig_h / fig_h_1cam)
         else:
             fig_h = fig_h_1cam
-            right_col_w = left_col_w
+            other_col_w = img_col_w
 
-        fig_w = left_col_w + right_col_w
+        fig_w = other_col_w + img_col_w
         self.fig = plt.figure(figsize=[fig_w, fig_h])
-        gs_outer = plt.GridSpec(1, 2, figure=self.fig, width_ratios=[left_col_w, right_col_w],
-                                 left=0.01, right=0.99, top=0.97, bottom=0.06, wspace=0.3)
+        # camera image(s) on the right, everything else (feedback/force-vs-time/target/current)
+        # on the left - left needs real margin now (unlike when this edge only ever held a
+        # borderless axis('off') image), so tick/axis labels on the left column aren't clipped
+        gs_outer = plt.GridSpec(1, 2, figure=self.fig, width_ratios=[other_col_w, img_col_w],
+                                 left=0.05, right=0.99, top=0.97, bottom=0.06, wspace=0.3)
         if has_cam2:
-            gs_left = gs_outer[0].subgridspec(2, 1, height_ratios=[h_crop / w_crop, h_crop2 / w_crop2], hspace=0.08)
-            ax_img = self.fig.add_subplot(gs_left[0])
-            ax_img_2 = self.fig.add_subplot(gs_left[1])
+            gs_img = gs_outer[1].subgridspec(2, 1, height_ratios=[h_crop / w_crop, h_crop2 / w_crop2], hspace=0.08)
+            ax_img = self.fig.add_subplot(gs_img[0])
+            ax_img_2 = self.fig.add_subplot(gs_img[1])
         else:
-            ax_img = self.fig.add_subplot(gs_outer[0])
+            ax_img = self.fig.add_subplot(gs_outer[1])
             ax_img_2 = None
-        gs_right     = gs_outer[1].subgridspec(2, 1, hspace=0.5)
-        self.ax_lickport = self.fig.add_subplot(gs_right[0])
-        gs_bot       = gs_right[1].subgridspec(1, 2, wspace=0.1)
+        gs_other = gs_outer[0].subgridspec(2, 1, hspace=0.5)
+        # feedback/lickport (top of the pair) shares its x axis with force-vs-time (bottom of the
+        # pair), same as the block/session plots' equivalent stacked panels
+        gs_top       = gs_other[0].subgridspec(2, 1, hspace=0.15)
+        self.ax_force_time = self.fig.add_subplot(gs_top[1])
+        self.ax_lickport   = self.fig.add_subplot(gs_top[0], sharex=self.ax_force_time)
+        gs_bot       = gs_other[1].subgridspec(1, 2, wspace=0.1)
         ax_target    = self.fig.add_subplot(gs_bot[0])
         self.ax_current = self.fig.add_subplot(gs_bot[1], sharex=ax_target, sharey=ax_target)
 
@@ -377,20 +386,38 @@ class _VideoFrameArtists:
         self.ax_current.set_title(self.labels['lbl_current'], fontsize=11)
         plt.setp(self.ax_current.get_yticklabels(), visible=False)
 
-        # --- static: feedback/lickport axis limits and labels depend only on the fixed video
-        # time window, not on t_now, so they're set once here ---
+        # --- static: feedback/lickport and force-vs-time axis limits/labels depend only on the
+        # fixed video time window, not on t_now, so they're set once here ---
         t_video_start = data['t_video_start']
         t_video_end   = data['t_video_end']
         self.x0 = t_video_start  # reference for x-axis (0 = start of video window)
         self.ax_lickport.set_xlim([0, t_video_end - self.x0])
+        # explicit ylim, not just autoscale: the line/eventplot/star artists below are all
+        # created once here with empty placeholder data and filled in later via .set_data(),
+        # which - unlike a fresh ax.plot() call - does NOT trigger matplotlib's autoscale, so
+        # without this the axis stayed stuck at whatever range it drew for that empty data and
+        # clipped off the "target" (y=1) end once the trace actually reached it. 0=start/1=target
+        # is a fixed normalized range for the whole block anyway, so a static ylim is correct
+        # here regardless - padded a bit above 1 for the eventplot ticks at lineoffset=1.1
+        self.ax_lickport.set_ylim([-0.08, 1.25])
         self.ax_lickport.set_yticks([0, 1])
         self.ax_lickport.set_yticklabels([self.labels['fb_start'], self.labels['fb_target']])
-        self.ax_lickport.set_xlabel(self.labels['time'])
         self.ax_lickport.set_ylabel(self.labels['feedback'])
+        plt.setp(self.ax_lickport.get_xticklabels(), visible=False)  # x axis shared with the panel below
 
-        # --- dynamic: lickport/feedback trace (placeholder artists; spans are recreated each
-        # update() since their count and extents both change as more of the trial is revealed) ---
+        self.ax_force_time.set_ylim([-force_axis_limit, force_axis_limit])
+        self.ax_force_time.set_xlabel(self.labels['time'])
+        self.ax_force_time.set_ylabel(self.labels['force_time'])
+        self.ax_force_time.legend(
+            handles=[plt.Line2D([0], [0], color='tab:blue', label=self.labels['lr_label']),
+                     plt.Line2D([0], [0], color='tab:orange', label=self.labels['pa_label'])],
+            loc='upper right', fontsize=7, ncol=2, framealpha=0.6)
+
+        # --- dynamic: lickport/feedback trace (placeholder artists; spans/reward lines are
+        # recreated each update() since their count and extents both change as more of the trial
+        # is revealed) ---
         self.spans = []
+        self.reward_lines = []
         self.lick_events = self.ax_lickport.eventplot(
             [], orientation='horizontal', lineoffsets=1.1, linelengths=0.15, colors='black')[0]
         self.line_lickport, = self.ax_lickport.step([], [], 'k-', where='post')
@@ -398,7 +425,36 @@ class _VideoFrameArtists:
                                              markeredgecolor='orange', markeredgewidth=1, zorder=5)
         self.vline = self.ax_lickport.axvline(t_now - self.x0, color='r', linestyle='--', linewidth=1)
 
+        # --- dynamic: force-vs-time (same LR/PA traces as the Current panel, plotted over time
+        # instead of space; matches the block/session plots' force-vs-time panel) ---
+        self.line_force_lr, = self.ax_force_time.plot([], [], '-', color='tab:blue', linewidth=0.7, alpha=0.7)
+        self.line_force_pa, = self.ax_force_time.plot([], [], '-', color='tab:orange', linewidth=0.7, alpha=0.7)
+        self.vline2 = self.ax_force_time.axvline(t_now - self.x0, color='r', linestyle='--', linewidth=1)
+
         self.update(video_frame, t_now, video_frame_2=video_frame_2)
+
+    def _shade_periods(self, ax, t_end):
+        """Quiescence/response shading for one axis, clipped to what's visible so far (t_end) -
+        matching behavior_plots' _shade_trial_periods. Appends the new patches to self.spans so
+        update() can remove them next frame; called once per axis that needs this shading."""
+        data = self.data
+        t_video_start = data['t_video_start']
+        x0 = self.x0
+        for period in data['trial_periods']:
+            p_start = period['t_start']
+            if p_start > t_end or period['t_end'] < t_video_start:
+                continue
+            q_end = period['quiescence_end']
+            if q_end is None:
+                continue
+            gray_start, gray_end = max(p_start, t_video_start), min(q_end, t_end)
+            if gray_end > gray_start:
+                self.spans.append(ax.axvspan(gray_start - x0, gray_end - x0, color='gray', alpha=0.15, linewidth=0))
+            if t_end > q_end:
+                r_end = period['response_end'] if period['response_end'] is not None else period['t_end']
+                gold_end = min(r_end, t_end)
+                if gold_end > q_end:
+                    self.spans.append(ax.axvspan(q_end - x0, gold_end - x0, color='gold', alpha=0.15, linewidth=0))
 
     def update(self, video_frame, t_now, video_frame_2=None):
         data = self.data
@@ -430,33 +486,27 @@ class _VideoFrameArtists:
         all_lickport_norm = data['all_lickport_norm']
         all_threshold_t   = data['all_threshold_t']
         all_lick_t        = data['all_lick_t']
+        all_reward_t      = data['all_reward_t']
 
-        # quiescence/response shading per trial (matching the Block Detail tab's plot), clipped
-        # to what's visible so far -- like the trace/markers above, it only reveals up to t_end
-        # so the video doesn't spoil what hasn't happened yet. Both the count and the extent of
-        # these spans change as t_end advances, so - unlike the line/image artists above - they
-        # can't be updated in place; drop the old ones and add fresh ones each frame instead,
-        # which is still far cheaper than rebuilding the whole figure was.
+        # quiescence/response shading + reward markers, clipped to what's visible so far -- like
+        # the trace/markers above, they only reveal up to t_end so the video doesn't spoil what
+        # hasn't happened yet. Count and extent both change as t_end advances, so - unlike the
+        # line/image artists above - these can't be updated in place; drop the old ones and add
+        # fresh ones each frame instead, which is still far cheaper than rebuilding the figure.
         for span in self.spans:
             span.remove()
         self.spans = []
-        for period in data['trial_periods']:
-            p_start = period['t_start']
-            if p_start > t_end or period['t_end'] < t_video_start:
-                continue
-            q_end = period['quiescence_end']
-            if q_end is None:
-                continue
-            gray_start, gray_end = max(p_start, t_video_start), min(q_end, t_end)
-            if gray_end > gray_start:
-                self.spans.append(self.ax_lickport.axvspan(
-                    gray_start - x0, gray_end - x0, color='gray', alpha=0.15, linewidth=0))
-            if t_end > q_end:
-                r_end = period['response_end'] if period['response_end'] is not None else period['t_end']
-                gold_end = min(r_end, t_end)
-                if gold_end > q_end:
-                    self.spans.append(self.ax_lickport.axvspan(
-                        q_end - x0, gold_end - x0, color='gold', alpha=0.15, linewidth=0))
+        self._shade_periods(self.ax_lickport, t_end)
+        self._shade_periods(self.ax_force_time, t_end)
+
+        for line in self.reward_lines:
+            line.remove()
+        self.reward_lines = []
+        if all_reward_t.size:
+            reward_mask = (all_reward_t >= t_video_start) & (all_reward_t <= t_end)
+            for rt in all_reward_t[reward_mask]:
+                self.reward_lines.append(
+                    self.ax_force_time.axvline(rt - x0, color='green', linewidth=1.2, alpha=0.8))
 
         if all_lick_t.size:
             lick_mask = (all_lick_t >= t_video_start) & (all_lick_t <= t_end)
@@ -471,6 +521,11 @@ class _VideoFrameArtists:
             thr_mask = (all_threshold_t >= t_video_start) & (all_threshold_t <= t_end)
             self.stars.set_data(all_threshold_t[thr_mask] - x0, np.ones(thr_mask.sum()))
         self.vline.set_xdata([t_now - x0, t_now - x0])
+
+        force_mask = (all_force_t >= t_video_start) & (all_force_t <= t_end)
+        self.line_force_lr.set_data(all_force_t[force_mask] - x0, all_force_lr[force_mask])
+        self.line_force_pa.set_data(all_force_t[force_mask] - x0, all_force_pa[force_mask])
+        self.vline2.set_xdata([t_now - x0, t_now - x0])
 
     def close(self):
         plt.close(self.fig)

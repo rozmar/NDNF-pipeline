@@ -606,6 +606,11 @@ def plot_session_blocks_overview(subject_id, session,
 
     available_blocks = np.sort((experiment.Block() & {'subject_id': subject_id, 'session': session}).fetch('block'))
     n_blocks = len(available_blocks)
+    if n_blocks == 0:
+        # fail with a clear, actionable message here rather than a bare "min() iterable
+        # argument is empty" once block_data (populated below) turns out empty - e.g. a session
+        # that's been created but has no completed blocks logged yet
+        raise RuntimeError(f"No blocks found for {subject_id} session {session}.")
     session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': session}).fetch1('session_date', 'session_time')
     block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
 
