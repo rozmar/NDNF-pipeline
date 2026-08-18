@@ -270,6 +270,212 @@ def _prepare_frame(bgr_frame, crop, clims):
     return np.clip((rgb.astype(float) - lo) / (hi - lo), 0, 1)
 
 
+class _VideoFrameArtists:
+    """Builds the video-overlay figure once (frame 0), then update() mutates only the artists
+    that actually change per frame instead of rebuilding the whole Figure/Axes from scratch
+    every time. Rebuilding was the actual rendering bottleneck (~700ms/frame, mostly matplotlib
+    regenerating every tick label from nothing) even after fixing the separate video-seek cost -
+    truly per-frame content is only the camera image(s) and the progressively-revealed force
+    trajectory/feedback trace; everything else - target LUT panel above all, since it's the same
+    for the whole block, but also every axis label/title/tick/limit - is drawn exactly once here
+    and left alone, updated via cheap methods (.set_data()/.set_positions()/.remove()+re-add for
+    the variable-count shaded spans) instead of matplotlib re-deriving it from nothing.
+
+    update() is a straight port of what make_trial_video_frame_figure used to recompute inline
+    on every call - same masks, same data, same draw order - just applied to existing artists
+    instead of creating fresh ones; see that function (still the single-frame entry point, e.g.
+    for preview_last_frame) for the one-frame equivalent this must stay behaviorally identical to.
+    """
+
+    def __init__(self, data, video_frame, t_now, crop, clims, tail_s=5, force_axis_limit=10.0,
+                 lang='en', is_preview=False, video_frame_2=None, crop_2=None, clims_2=None):
+        self.data = data
+        self.crop = crop
+        self.clims = clims
+        self.crop_2 = crop_2 if crop_2 is not None else (0, 0, 0, 0)
+        self.clims_2 = clims_2 if clims_2 is not None else clims
+        self.tail_s = tail_s
+        self.is_preview = is_preview
+        self.labels = _LABELS[lang]
+        has_cam2 = video_frame_2 is not None
+
+        cl, cr, ct, cb = crop
+        h, w = video_frame.shape[:2]
+        h_crop = h - ct - (cb if cb else 0)
+        w_crop = w - cl - (cr if cr else 0)
+        # the camera-image column keeps a fixed width regardless of camera count, so each camera
+        # image is always the same size; a second stacked image makes the figure taller, and the
+        # right column's width is scaled up by that same factor so its own aspect ratio (and the
+        # target/current force squares within it) doesn't get squeezed narrow by the extra height
+        left_col_w = 7.5
+        fig_h_1cam = max(left_col_w * h_crop / w_crop, 7)
+
+        if has_cam2:
+            h2, w2 = video_frame_2.shape[:2]
+            cl2, cr2, ct2, cb2 = self.crop_2
+            h_crop2 = h2 - ct2 - (cb2 if cb2 else 0)
+            w_crop2 = w2 - cl2 - (cr2 if cr2 else 0)
+            fig_h = max(left_col_w * h_crop / w_crop + left_col_w * h_crop2 / w_crop2, 7)
+            right_col_w = left_col_w * (fig_h / fig_h_1cam)
+        else:
+            fig_h = fig_h_1cam
+            right_col_w = left_col_w
+
+        fig_w = left_col_w + right_col_w
+        self.fig = plt.figure(figsize=[fig_w, fig_h])
+        gs_outer = plt.GridSpec(1, 2, figure=self.fig, width_ratios=[left_col_w, right_col_w],
+                                 left=0.01, right=0.99, top=0.97, bottom=0.06, wspace=0.3)
+        if has_cam2:
+            gs_left = gs_outer[0].subgridspec(2, 1, height_ratios=[h_crop / w_crop, h_crop2 / w_crop2], hspace=0.08)
+            ax_img = self.fig.add_subplot(gs_left[0])
+            ax_img_2 = self.fig.add_subplot(gs_left[1])
+        else:
+            ax_img = self.fig.add_subplot(gs_outer[0])
+            ax_img_2 = None
+        gs_right     = gs_outer[1].subgridspec(2, 1, hspace=0.5)
+        self.ax_lickport = self.fig.add_subplot(gs_right[0])
+        gs_bot       = gs_right[1].subgridspec(1, 2, wspace=0.1)
+        ax_target    = self.fig.add_subplot(gs_bot[0])
+        self.ax_current = self.fig.add_subplot(gs_bot[1], sharex=ax_target, sharey=ax_target)
+
+        # --- static: camera image axes (title/off-axis set once; pixel content updates per frame) ---
+        self.im1 = ax_img.imshow(_prepare_frame(video_frame, crop, clims))
+        ax_img.axis('off')
+        if is_preview:
+            ax_img.set_title(f"{data['camera_name']}  subject={data['subject_id']}  session={data['session']}  "
+                              f"block={data['block']}  trials {data['trial_start']}–{data['trial_end']}  [LAST FRAME]",
+                              fontsize=11)
+        else:
+            ax_img.set_title(data['camera_name'], fontsize=9)
+        self.im2 = None
+        if has_cam2:
+            self.im2 = ax_img_2.imshow(_prepare_frame(video_frame_2, self.crop_2, self.clims_2))
+            ax_img_2.axis('off')
+            ax_img_2.set_title(data['camera_name_2'], fontsize=9)
+
+        # --- fully static: target LUT never changes within a block, so it's drawn once and
+        # never touched again by update() - this is the panel that was previously getting
+        # rebuilt from scratch on every single frame for no reason ---
+        target_force_lut = data['target_force_lut']
+        lut_extent = data['lut_extent']
+        uniform_extent = [-force_axis_limit, force_axis_limit, -force_axis_limit, force_axis_limit]
+        vmin, vmax = np.min(target_force_lut), np.max(target_force_lut)
+        lut_disp = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
+        ax_target.imshow(lut_disp, extent=uniform_extent, origin='lower',
+                          cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
+        ax_target.set_xlim([-force_axis_limit, force_axis_limit])
+        ax_target.set_ylim([-force_axis_limit, force_axis_limit])
+        ax_target.set_xlabel(self.labels['force_x'], fontsize=10)
+        ax_target.set_ylabel(self.labels['force_y'], fontsize=10)
+        ax_target.set_title(self.labels['lbl_target'], fontsize=11)
+
+        # --- dynamic: force trajectory (placeholder artists now, real data via update() below) ---
+        self.line_all,  = self.ax_current.plot([], [], '-', color='lightgray', linewidth=0.7)
+        self.line_tail, = self.ax_current.plot([], [], 'k-', linewidth=2)
+        self.marker_now, = self.ax_current.plot([], [], 'ro', markersize=12)
+        self.ax_current.set_xlabel(self.labels['force_x'], fontsize=10)
+        self.ax_current.set_title(self.labels['lbl_current'], fontsize=11)
+        plt.setp(self.ax_current.get_yticklabels(), visible=False)
+
+        # --- static: feedback/lickport axis limits and labels depend only on the fixed video
+        # time window, not on t_now, so they're set once here ---
+        t_video_start = data['t_video_start']
+        t_video_end   = data['t_video_end']
+        self.x0 = t_video_start  # reference for x-axis (0 = start of video window)
+        self.ax_lickport.set_xlim([0, t_video_end - self.x0])
+        self.ax_lickport.set_yticks([0, 1])
+        self.ax_lickport.set_yticklabels([self.labels['fb_start'], self.labels['fb_target']])
+        self.ax_lickport.set_xlabel(self.labels['time'])
+        self.ax_lickport.set_ylabel(self.labels['feedback'])
+
+        # --- dynamic: lickport/feedback trace (placeholder artists; spans are recreated each
+        # update() since their count and extents both change as more of the trial is revealed) ---
+        self.spans = []
+        self.lick_events = self.ax_lickport.eventplot(
+            [], orientation='horizontal', lineoffsets=1.1, linelengths=0.15, colors='black')[0]
+        self.line_lickport, = self.ax_lickport.step([], [], 'k-', where='post')
+        self.stars, = self.ax_lickport.plot([], [], '*', color='gold', markersize=14,
+                                             markeredgecolor='orange', markeredgewidth=1, zorder=5)
+        self.vline = self.ax_lickport.axvline(t_now - self.x0, color='r', linestyle='--', linewidth=1)
+
+        self.update(video_frame, t_now, video_frame_2=video_frame_2)
+
+    def update(self, video_frame, t_now, video_frame_2=None):
+        data = self.data
+        self.im1.set_data(_prepare_frame(video_frame, self.crop, self.clims))
+        if self.im2 is not None and video_frame_2 is not None:
+            self.im2.set_data(_prepare_frame(video_frame_2, self.crop_2, self.clims_2))
+
+        all_force_t  = data['all_force_t']
+        all_force_lr = data['all_force_lr']
+        all_force_pa = data['all_force_pa']
+        # the whole trajectory up to now, in light grey, for context -- drawn first (lowest
+        # zorder-equivalent, i.e. created first) so the black tail_s-second tail draws on top
+        # of it for the most recent segment
+        mask_all = all_force_t <= t_now
+        self.line_all.set_data(all_force_lr[mask_all], all_force_pa[mask_all])
+        mask = (all_force_t >= t_now - self.tail_s) & (all_force_t <= t_now)
+        self.line_tail.set_data(all_force_lr[mask], all_force_pa[mask])
+        if mask.any():
+            self.marker_now.set_data([all_force_lr[mask][-1]], [all_force_pa[mask][-1]])
+        else:
+            self.marker_now.set_data([], [])
+
+        t_video_start = data['t_video_start']
+        t_video_end   = data['t_video_end']
+        t_end = t_video_end if self.is_preview else t_now
+        x0 = self.x0
+
+        all_lickport_t    = data['all_lickport_t']
+        all_lickport_norm = data['all_lickport_norm']
+        all_threshold_t   = data['all_threshold_t']
+        all_lick_t        = data['all_lick_t']
+
+        # quiescence/response shading per trial (matching the Block Detail tab's plot), clipped
+        # to what's visible so far -- like the trace/markers above, it only reveals up to t_end
+        # so the video doesn't spoil what hasn't happened yet. Both the count and the extent of
+        # these spans change as t_end advances, so - unlike the line/image artists above - they
+        # can't be updated in place; drop the old ones and add fresh ones each frame instead,
+        # which is still far cheaper than rebuilding the whole figure was.
+        for span in self.spans:
+            span.remove()
+        self.spans = []
+        for period in data['trial_periods']:
+            p_start = period['t_start']
+            if p_start > t_end or period['t_end'] < t_video_start:
+                continue
+            q_end = period['quiescence_end']
+            if q_end is None:
+                continue
+            gray_start, gray_end = max(p_start, t_video_start), min(q_end, t_end)
+            if gray_end > gray_start:
+                self.spans.append(self.ax_lickport.axvspan(
+                    gray_start - x0, gray_end - x0, color='gray', alpha=0.15, linewidth=0))
+            if t_end > q_end:
+                r_end = period['response_end'] if period['response_end'] is not None else period['t_end']
+                gold_end = min(r_end, t_end)
+                if gold_end > q_end:
+                    self.spans.append(self.ax_lickport.axvspan(
+                        q_end - x0, gold_end - x0, color='gold', alpha=0.15, linewidth=0))
+
+        if all_lick_t.size:
+            lick_mask = (all_lick_t >= t_video_start) & (all_lick_t <= t_end)
+            self.lick_events.set_positions(all_lick_t[lick_mask] - x0 if lick_mask.any() else [])
+
+        lp_mask = (all_lickport_t >= t_video_start) & (all_lickport_t <= t_end)
+        # step, not a plain connecting line: load_trial_video_data already inserts held-value
+        # points at each gap in the raw log (e.g. an unlogged quiescence period), so a straight
+        # line would draw those as a gradual ramp instead of the flat hold they actually represent
+        self.line_lickport.set_data(all_lickport_t[lp_mask] - x0, all_lickport_norm[lp_mask])
+        if all_threshold_t.size:
+            thr_mask = (all_threshold_t >= t_video_start) & (all_threshold_t <= t_end)
+            self.stars.set_data(all_threshold_t[thr_mask] - x0, np.ones(thr_mask.sum()))
+        self.vline.set_xdata([t_now - x0, t_now - x0])
+
+    def close(self):
+        plt.close(self.fig)
+
+
 def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=5,
                                    force_axis_limit=10.0, lang='en', is_preview=False,
                                    video_frame_2=None, crop_2=None, clims_2=None):
@@ -280,147 +486,14 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
     falls back to crop, clims_2 falls back to clims, if not given) instead of the single image
     spanning the full column height; the right column (feedback trace, target/current force) is
     unchanged either way.
+
+    A thin single-frame entry point (used by preview_last_frame) over _VideoFrameArtists, which
+    render_trial_video drives directly across many frames instead, updating only what changes
+    per frame rather than paying for this from-scratch build on every one of them.
     """
-    labels = _LABELS[lang]
-    cl, cr, ct, cb = crop
-    h, w = video_frame.shape[:2]
-    h_crop = h - ct - (cb if cb else 0)
-    w_crop = w - cl - (cr if cr else 0)
-    # the camera-image column keeps a fixed width regardless of camera count, so each camera
-    # image is always the same size; a second stacked image makes the figure taller, and the
-    # right column's width is scaled up by that same factor so its own aspect ratio (and the
-    # target/current force squares within it) doesn't get squeezed narrow by the extra height
-    left_col_w = 7.5
-    fig_h_1cam = max(left_col_w * h_crop / w_crop, 7)
-
-    if video_frame_2 is not None:
-        crop_2 = crop_2 if crop_2 is not None else (0, 0, 0, 0)
-        cl2, cr2, ct2, cb2 = crop_2
-        h2, w2 = video_frame_2.shape[:2]
-        h_crop2 = h2 - ct2 - (cb2 if cb2 else 0)
-        w_crop2 = w2 - cl2 - (cr2 if cr2 else 0)
-        fig_h = max(left_col_w * h_crop / w_crop + left_col_w * h_crop2 / w_crop2, 7)
-        right_col_w = left_col_w * (fig_h / fig_h_1cam)
-    else:
-        fig_h = fig_h_1cam
-        right_col_w = left_col_w
-
-    fig_w = left_col_w + right_col_w
-    fig = plt.figure(figsize=[fig_w, fig_h])
-    gs_outer = plt.GridSpec(1, 2, figure=fig, width_ratios=[left_col_w, right_col_w],
-                             left=0.01, right=0.99, top=0.97, bottom=0.06, wspace=0.3)
-    if video_frame_2 is not None:
-        gs_left = gs_outer[0].subgridspec(2, 1, height_ratios=[h_crop / w_crop, h_crop2 / w_crop2], hspace=0.08)
-        ax_img = fig.add_subplot(gs_left[0])
-        ax_img_2 = fig.add_subplot(gs_left[1])
-    else:
-        ax_img = fig.add_subplot(gs_outer[0])
-        ax_img_2 = None
-    gs_right    = gs_outer[1].subgridspec(2, 1, hspace=0.5)
-    ax_lickport = fig.add_subplot(gs_right[0])
-    gs_bot      = gs_right[1].subgridspec(1, 2, wspace=0.1)
-    ax_target   = fig.add_subplot(gs_bot[0])
-    ax_current  = fig.add_subplot(gs_bot[1], sharex=ax_target, sharey=ax_target)
-
-    ax_img.imshow(_prepare_frame(video_frame, crop, clims))
-    ax_img.axis('off')
-    ax_img.set_title(data['camera_name'], fontsize=9)
-    if is_preview:
-        ax_img.set_title(f"{data['camera_name']}  subject={data['subject_id']}  session={data['session']}  "
-                          f"block={data['block']}  trials {data['trial_start']}–{data['trial_end']}  [LAST FRAME]",
-                          fontsize=11)
-    if ax_img_2 is not None:
-        ax_img_2.imshow(_prepare_frame(video_frame_2, crop_2, clims_2 if clims_2 is not None else clims))
-        ax_img_2.axis('off')
-        ax_img_2.set_title(data['camera_name_2'], fontsize=9)
-
-    target_force_lut = data['target_force_lut']
-    lut_extent = data['lut_extent']
-    uniform_extent = [-force_axis_limit, force_axis_limit, -force_axis_limit, force_axis_limit]
-    vmin, vmax = np.min(target_force_lut), np.max(target_force_lut)
-    # same edge-padding behavior_plots.plot_block_force_figure/plot_session_blocks_overview use
-    # for their force_uniform_range=True display: replicate the LUT's own border pixels outward
-    # to fill uniform_extent, rather than a flat single-corner-value fill - and _pad_lut_to_range
-    # applies the transpose imshow needs (target_force_lut is stored [LR, PA]; imshow with
-    # extent=[lr..., pa...] needs [PA, LR] so rows track the y/PA axis) which was missing before,
-    # leaving the LUT effectively transposed relative to the block/session plots
-    lut_disp = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
-    ax_target.imshow(lut_disp, extent=uniform_extent, origin='lower',
-                      cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
-    ax_target.set_xlim([-force_axis_limit, force_axis_limit])
-    ax_target.set_ylim([-force_axis_limit, force_axis_limit])
-    ax_target.set_xlabel(labels['force_x'], fontsize=10)
-    ax_target.set_ylabel(labels['force_y'], fontsize=10)
-    ax_target.set_title(labels['lbl_target'], fontsize=11)
-
-    all_force_t  = data['all_force_t']
-    all_force_lr = data['all_force_lr']
-    all_force_pa = data['all_force_pa']
-    # the whole trajectory up to now, in light grey, for context -- drawn first so the black
-    # tail_s-second tail (unchanged) draws on top of it for the most recent segment
-    mask_all = all_force_t <= t_now
-    ax_current.plot(all_force_lr[mask_all], all_force_pa[mask_all], '-', color='lightgray', linewidth=0.7)
-    mask = (all_force_t >= t_now - tail_s) & (all_force_t <= t_now)
-    ax_current.plot(all_force_lr[mask], all_force_pa[mask], 'k-', linewidth=2)
-    if mask.any():
-        ax_current.plot(all_force_lr[mask][-1], all_force_pa[mask][-1], 'ro', markersize=12)
-    ax_current.set_xlabel(labels['force_x'], fontsize=10)
-    ax_current.set_title(labels['lbl_current'], fontsize=11)
-    plt.setp(ax_current.get_yticklabels(), visible=False)
-
-    t_video_start = data['t_video_start']
-    t_video_end   = data['t_video_end']
-    t_end = t_video_end if is_preview else t_now
-    x0    = t_video_start   # reference for x-axis (0 = start of video window)
-
-    all_lickport_t    = data['all_lickport_t']
-    all_lickport_norm = data['all_lickport_norm']
-    all_threshold_t   = data['all_threshold_t']
-    all_lick_t        = data['all_lick_t']
-
-    # quiescence/response shading per trial (matching the Block Detail tab's plot), clipped to
-    # what's visible so far -- like the trace/markers below, it only reveals up to t_end so the
-    # video doesn't spoil what hasn't happened yet
-    for period in data['trial_periods']:
-        p_start = period['t_start']
-        if p_start > t_end or period['t_end'] < t_video_start:
-            continue
-        q_end = period['quiescence_end']
-        if q_end is None:
-            continue
-        gray_start, gray_end = max(p_start, t_video_start), min(q_end, t_end)
-        if gray_end > gray_start:
-            ax_lickport.axvspan(gray_start - x0, gray_end - x0, color='gray', alpha=0.15, linewidth=0)
-        if t_end > q_end:
-            r_end = period['response_end'] if period['response_end'] is not None else period['t_end']
-            gold_end = min(r_end, t_end)
-            if gold_end > q_end:
-                ax_lickport.axvspan(q_end - x0, gold_end - x0, color='gold', alpha=0.15, linewidth=0)
-
-    if all_lick_t.size:
-        lick_mask = (all_lick_t >= t_video_start) & (all_lick_t <= t_end)
-        if lick_mask.any():
-            ax_lickport.eventplot(all_lick_t[lick_mask] - x0, orientation='horizontal',
-                                   lineoffsets=1.1, linelengths=0.15, colors='black')
-
-    lp_mask = (all_lickport_t >= t_video_start) & (all_lickport_t <= t_end)
-    # step, not a plain connecting line: load_trial_video_data already inserts held-value points
-    # at each gap in the raw log (e.g. an unlogged quiescence period), so a straight line would
-    # draw those as a gradual ramp instead of the flat hold they actually represent
-    ax_lickport.step(all_lickport_t[lp_mask] - x0, all_lickport_norm[lp_mask], 'k-', where='post')
-    if all_threshold_t.size:
-        thr_mask = (all_threshold_t >= t_video_start) & (all_threshold_t <= t_end)
-        ax_lickport.plot(all_threshold_t[thr_mask] - x0,
-                          np.ones(thr_mask.sum()), '*', color='gold',
-                          markersize=14, markeredgecolor='orange', markeredgewidth=1, zorder=5)
-    ax_lickport.axvline(t_now - x0, color='r', linestyle='--', linewidth=1)
-    ax_lickport.set_xlim([0, t_video_end - x0])
-    ax_lickport.set_yticks([0, 1])
-    ax_lickport.set_yticklabels([labels['fb_start'], labels['fb_target']])
-    ax_lickport.set_xlabel(labels['time'])
-    ax_lickport.set_ylabel(labels['feedback'])
-
-    return fig
+    return _VideoFrameArtists(data, video_frame, t_now, crop, clims, tail_s=tail_s,
+                               force_axis_limit=force_axis_limit, lang=lang, is_preview=is_preview,
+                               video_frame_2=video_frame_2, crop_2=crop_2, clims_2=clims_2).fig
 
 
 def _read_last_frame(video_file_path, frame_index):
@@ -545,6 +618,7 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     cap2    = cv2.VideoCapture(data['video_file_path_2']) if has_cam2 else None
     tmp_dir = tempfile.mkdtemp()
     cam1_pos, cam2_pos = None, None  # next-read position each cap is currently at; None = unknown/forces a seek
+    artists = None
     try:
         for frame_i, (abs_frame, t_now) in enumerate(zip(selected_abs, selected_times)):
             abs_frame = int(abs_frame)
@@ -561,16 +635,34 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
                 cam2_pos = abs_frame_2 + 1 if ret2 else None
                 if not ret2:
                     frame_2 = None
-            fig = make_trial_video_frame_figure(data, frame, t_now, crop, clims,
-                                                 tail_s=tail_s, force_axis_limit=force_axis_limit, lang=lang,
-                                                 video_frame_2=frame_2, crop_2=crop_2, clims_2=clims_2)
-            plt.savefig(os.path.join(tmp_dir, f'frame_{frame_i:05d}.png'), dpi=150)
-            plt.close(fig)
+            if artists is None:
+                # figure/axes/target-LUT/labels built once here from frame 0 (including whether
+                # there's a second-camera panel at all, decided by whether frame 0's cam2 read
+                # succeeded - same as the old per-frame-rebuild code would decide for frame 0;
+                # unlike that old code, a *later* frame's failed cam2 read now just freezes that
+                # panel on its last image instead of restructuring the whole figure layout
+                # (which would otherwise mean every output frame recreating every axis/tick/label
+                # from scratch again, defeating the entire point of building this once)
+                artists = _VideoFrameArtists(data, frame, t_now, crop, clims, tail_s=tail_s,
+                                              force_axis_limit=force_axis_limit, lang=lang,
+                                              video_frame_2=frame_2, crop_2=crop_2, clims_2=clims_2)
+            else:
+                artists.update(frame, t_now, video_frame_2=frame_2)
+            # compress_level=1 (default is much higher): these PNGs are throwaway - ffmpeg reads
+            # them once below and then the whole tmp_dir is deleted - so there's no reason to
+            # spend CPU on smaller file size. PNG compression is always lossless regardless of
+            # level, so this is a pure speed win with zero effect on the rendered video's quality
+            # (measured ~20% faster per frame; unlike this, lowering dpi *would* trade real
+            # output resolution for speed, so that's left as a choice rather than changed here)
+            artists.fig.savefig(os.path.join(tmp_dir, f'frame_{frame_i:05d}.png'), dpi=150,
+                                 pil_kwargs={'compress_level': 1})
             if frame_i % 50 == 0:
                 print(f'  {frame_i}/{n_out}')
         cap.release()
         if cap2 is not None:
             cap2.release()
+        if artists is not None:
+            artists.close()
         print('Stitching with ffmpeg ...')
         subprocess.run([
             'ffmpeg', '-y',
