@@ -1,11 +1,18 @@
+import json
 import os
 import subprocess
 import tempfile
 import shutil
+from datetime import datetime, timezone
+from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import datajoint as dj
+
+from ndnf_pipeline.plot.behavior_plots import (
+    FILTER_METHODS, _filter_trace, _estimate_sample_interval, ms_to_samples, ms_to_samples_float,
+    _get_block_force_axes, _normalize_lut, _pad_lut_to_range)
 
 _LABELS = {
     'en': dict(time='Time (s)', feedback='Feedback',
@@ -86,7 +93,9 @@ def _camera_frame_window(file_frame_times, t_video_start, t_video_end):
 
 
 def load_trial_video_data(subject_id, session, block, trial_start, trial_end, camera_name,
-                           camera_name_2=None, pad_start=1.0, pad_end=1.0):
+                           camera_name_2=None, pad_start=1.0, pad_end=1.0,
+                           filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
+                           filter_polyorder=3):
     """Fetch and normalize everything needed to render a trial-range video for one block.
 
     If camera_name_2 is given, a second camera's frames are resolved too (clipped to the same
@@ -95,6 +104,14 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
 
     X is always Left-Right (L<0, R>0) and Y is always Posterior-Anterior (P<0, A>0),
     same convention as ndnf_pipeline.plot.behavior_plots.
+
+    filter_method smooths each trial's force trace (per-trial, same as
+    behavior_plots.plot_block_force_figure) with one of FILTER_METHODS: None/'none' (no
+    filtering, the default), 'boxcar' (moving average, `filter_window_ms`), 'median'
+    (`filter_window_ms`), 'gaussian' (`filter_sigma_ms`), or 'savgol' (Savitzky-Golay
+    polynomial fit, `filter_window_ms` and `filter_polyorder`). `filter_window_ms`/
+    `filter_sigma_ms` are converted to samples using the block's own force trace sample
+    interval, estimated from the first trial. This is the trace drawn in the video dashboard.
 
     Returns a dict consumed by make_trial_video_frame_figure/preview_last_frame/render_trial_video.
     """
@@ -109,34 +126,19 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
     trials_needed = block_trials[trial_start: trial_end + 1]
 
     # --- force LUT and axis info from TaskSettings ---
-    task_setting_id  = (experiment.Block() & key & {'block': block}).fetch1('task_setting_id')
-    target_force_lut = (experiment.TaskSettings() & key & {'task_setting_id': task_setting_id}).fetch1('target_force_lut')
-
-    force_axes = (experiment.TaskSettings.ForceAxis() & key & {'task_setting_id': task_setting_id}
-                  ).fetch('force_axis_idx', 'target_force_axes', 'force_direction', order_by='force_axis_idx')
-    force_axes_arrays = {idx: axes for idx, axes, _ in zip(*force_axes)}
-    force_directions  = {idx: d    for idx, _, d  in zip(*force_axes)}
+    task_setting_id      = (experiment.Block() & key & {'block': block}).fetch1('task_setting_id')
+    target_force_lut_raw = (experiment.TaskSettings() & key & {'task_setting_id': task_setting_id}).fetch1('target_force_lut')
 
     # --- normalize to X=LR (L<0, R>0) and Y=PA (P<0, A>0) ---
-    lr_idx = next(i for i in force_directions if force_directions[i] in ('LR', 'RL'))
-    pa_idx = next(i for i in force_directions if force_directions[i] in ('PA', 'AP'))
-    lr_sign = -1 if force_directions[lr_idx] == 'RL' else 1
-    pa_sign = -1 if force_directions[pa_idx] == 'AP' else 1
-
-    lr_ax = lr_sign * force_axes_arrays[lr_idx]
-    pa_ax = pa_sign * force_axes_arrays[pa_idx]
-    lr_extent = [float(lr_ax.min()), float(lr_ax.max())]
-    pa_extent = [float(pa_ax.min()), float(pa_ax.max())]
-
-    target_force_lut = target_force_lut.copy()
-    if lr_sign == -1:
-        target_force_lut = target_force_lut[:, ::-1] if lr_idx == 0 else target_force_lut[::-1, :]
-    if pa_sign == -1:
-        target_force_lut = target_force_lut[:, ::-1] if pa_idx == 0 else target_force_lut[::-1, :]
-    if lr_idx == 1:
-        target_force_lut = target_force_lut.T
-
-    lut_extent = [lr_extent[0], lr_extent[1], pa_extent[0], pa_extent[1]]
+    # shared with behavior_plots.plot_block_force_figure/plot_session_blocks_overview - was
+    # previously reimplemented here with the sign-flip applied to the wrong array axis (flipped
+    # dim1 where _normalize_lut flips dim0 for the same lr_idx==0 case, and vice versa), which
+    # visibly mirrored the target LUT wrong on any rig where lr_sign/pa_sign is -1; reusing the
+    # same function guarantees this stays pixel-consistent with those plots instead of drifting
+    force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(
+        experiment, subject_id, session, task_setting_id)
+    target_force_lut, lut_extent, lr_extent, pa_extent = _normalize_lut(
+        target_force_lut_raw, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
 
     # --- per-trial data (force, feedback, rewards, threshold crossings) ---
     all_force_t, all_force_0, all_force_1 = [], [], []
@@ -145,6 +147,10 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
     trial_start_times = {}
     trial_periods = []  # per-trial (t_start, t_end, quiescence_end, response_end), all absolute
 
+    # sample interval is estimated once, from the first trial, and reused for every trial in
+    # this block (matching estimate_force_sample_interval / plot_block_force_figure) - the
+    # acquisition rate doesn't change trial-to-trial, so this avoids re-estimating per trial
+    sample_interval_s = None
     lickport_carry = None  # last known lickport position, carried across the trial-to-trial gap
     for trial in trials_needed:
         t_start, t_end = (experiment.SessionTrial() & key & {'trial': trial}).fetch1('trial_start_time', 'trial_end_time')
@@ -154,6 +160,13 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
         ft = (experiment.TrialForceTrace()                & key & {'trial': trial}).fetch1('force_trace_time')
         f0 = (experiment.TrialForceTrace.TrialForceAxis() & key & {'trial': trial, 'force_axis_idx': 0}).fetch1('force_trace_value')
         f1 = (experiment.TrialForceTrace.TrialForceAxis() & key & {'trial': trial, 'force_axis_idx': 1}).fetch1('force_trace_value')
+        if filter_method and filter_method != 'none':
+            if sample_interval_s is None:
+                sample_interval_s = _estimate_sample_interval([ft])
+            filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
+            filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
+            f0 = _filter_trace(f0, filter_method, window=filter_window, sigma=filter_sigma, polyorder=filter_polyorder)
+            f1 = _filter_trace(f1, filter_method, window=filter_window, sigma=filter_sigma, polyorder=filter_polyorder)
         all_force_t.extend(ft + t_start);  all_force_0.extend(f0);  all_force_1.extend(f1)
 
         rewards    = np.asarray((experiment.TrialEvent() & key & {'trial': trial, 'trial_event_type': 'reward'}).fetch('trial_event_time'), float)
@@ -230,6 +243,9 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
         subject_id=subject_id, session=session, block=block,
         trial_start=trial_start, trial_end=trial_end,
         camera_name=camera_name, camera_name_2=camera_name_2,
+        pad_start=pad_start, pad_end=pad_end,
+        filter_method=filter_method, filter_window_ms=filter_window_ms,
+        filter_sigma_ms=filter_sigma_ms, filter_polyorder=filter_polyorder,
         trials_needed=trials_needed,
         target_force_lut=target_force_lut, lut_extent=lut_extent,
         all_force_t=all_force_t, all_force_lr=all_force_lr, all_force_pa=all_force_pa,
@@ -322,13 +338,14 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
     lut_extent = data['lut_extent']
     uniform_extent = [-force_axis_limit, force_axis_limit, -force_axis_limit, force_axis_limit]
     vmin, vmax = np.min(target_force_lut), np.max(target_force_lut)
-    # fill the view outside the LUT's native extent with one of the LUT's own corner
-    # values (its background level) instead of the global min, so a high corner value
-    # doesn't render as a dark background patch
-    background_value = target_force_lut[0, 0]
-    ax_target.imshow(np.ones(target_force_lut.shape) * background_value,
-                      extent=uniform_extent, cmap='viridis', vmin=vmin, vmax=vmax, aspect='auto')
-    ax_target.imshow(target_force_lut, extent=lut_extent, origin='lower',
+    # same edge-padding behavior_plots.plot_block_force_figure/plot_session_blocks_overview use
+    # for their force_uniform_range=True display: replicate the LUT's own border pixels outward
+    # to fill uniform_extent, rather than a flat single-corner-value fill - and _pad_lut_to_range
+    # applies the transpose imshow needs (target_force_lut is stored [LR, PA]; imshow with
+    # extent=[lr..., pa...] needs [PA, LR] so rows track the y/PA axis) which was missing before,
+    # leaving the LUT effectively transposed relative to the block/session plots
+    lut_disp = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
+    ax_target.imshow(lut_disp, extent=uniform_extent, origin='lower',
                       cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
     ax_target.set_xlim([-force_axis_limit, force_axis_limit])
     ax_target.set_ylim([-force_axis_limit, force_axis_limit])
@@ -452,10 +469,42 @@ def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=
     return fig, last_frame, clims, last_frame_2, clims_2
 
 
+def _advance_to_frame(cap, current_pos, target_pos, max_skip_reads=60):
+    """Position `cap` so its next .read() returns frame `target_pos`, preferring plain
+    sequential .read() calls over cv2.CAP_PROP_POS_FRAMES seeking whenever that's cheap.
+
+    render_trial_video's frame indices only ever increase (built from a sorted time array via
+    searchsorted), so consecutive targets are usually 1-3 frames apart - i.e. this is really
+    sequential playback. But cv2.VideoCapture.set(CAP_PROP_POS_FRAMES, ...) doesn't know that:
+    on inter-frame-compressed video (h264/h265 in an mkv, as used here) it reseeks to the
+    nearest preceding keyframe and redecodes forward every time, even for a 1-frame hop -
+    measured ~80x slower here than just calling .read() again and discarding what you don't
+    want. So: read-and-discard forward for a short hop, and only fall back to an actual seek
+    for the first frame, a backward jump, or a gap wide enough that reading through it would
+    cost more than a reseek would (empirically break-even is around 100 frames here; 60 stays
+    safely under that while comfortably covering real gaps, which are usually 1-3 frames).
+
+    current_pos: the frame index the next .read() currently returns, or None if unknown (forces
+    a seek - e.g. after a previous read failed). Returns the position callers should record
+    after their own .read() succeeds - always target_pos, since that's what .read() will yield.
+    """
+    if current_pos is not None and 0 <= target_pos - current_pos <= max_skip_reads:
+        for _ in range(target_pos - current_pos):
+            cap.read()
+    else:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_pos)
+    return target_pos
+
+
 def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop=(0, 0, 0, 0),
                         clims=None, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
                         crop_2=None, clims_2=None):
-    """Render and stitch the full trial-range video with ffmpeg. Returns output_path.
+    """Render and stitch the full trial-range video with ffmpeg.
+
+    Returns (output_path, clims, clims_2): the clims/clims_2 actually used, which is either
+    what was passed in or - when not given - what got auto-computed from the last frame, so a
+    caller that wants to record exactly what happened (see save_render_params) doesn't have to
+    duplicate that auto-detection logic itself.
 
     If data has a second camera (camera_name_2), its frames are read in lockstep with the first
     camera's (each output frame's timestamp is independently matched to each camera's own frame
@@ -495,16 +544,21 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     cap     = cv2.VideoCapture(data['video_file_path'])
     cap2    = cv2.VideoCapture(data['video_file_path_2']) if has_cam2 else None
     tmp_dir = tempfile.mkdtemp()
+    cam1_pos, cam2_pos = None, None  # next-read position each cap is currently at; None = unknown/forces a seek
     try:
         for frame_i, (abs_frame, t_now) in enumerate(zip(selected_abs, selected_times)):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(abs_frame))
+            abs_frame = int(abs_frame)
+            _advance_to_frame(cap, cam1_pos, abs_frame)
             ret, frame = cap.read()
+            cam1_pos = abs_frame + 1 if ret else None
             if not ret:
                 break
             frame_2 = None
             if has_cam2:
-                cap2.set(cv2.CAP_PROP_POS_FRAMES, int(selected_abs_2[frame_i]))
+                abs_frame_2 = int(selected_abs_2[frame_i])
+                _advance_to_frame(cap2, cam2_pos, abs_frame_2)
                 ret2, frame_2 = cap2.read()
+                cam2_pos = abs_frame_2 + 1 if ret2 else None
                 if not ret2:
                     frame_2 = None
             fig = make_trial_video_frame_figure(data, frame, t_now, crop, clims,
@@ -533,4 +587,69 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     finally:
         shutil.rmtree(tmp_dir)
 
-    return output_path
+    return output_path, clims, clims_2
+
+
+def save_render_params(data, output_path, video_fps, playback_speed, crop, clims,
+                        clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
+                        crop_2=None, clims_2=None):
+    """Write a JSON sidecar next to output_path recording every parameter needed to exactly
+    reproduce this render: which subject/session/block/trials/camera(s), the trace filter,
+    crop, and brightness settings actually used.
+
+    A sidecar file rather than embedding this in the video's own container metadata: metadata
+    doesn't reliably survive re-encoding, trimming, or upload to most video-sharing tools,
+    while a JSON file is trivially readable/greppable/diffable with no video-specific tooling,
+    and loads straight back into load_trial_video_data/render_trial_video kwargs (see
+    load_render_params/rerender_from_params) to actually redo the render, not just document it.
+    """
+    params = dict(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        subject_id=data['subject_id'], session=data['session'], block=data['block'],
+        trial_start=data['trial_start'], trial_end=data['trial_end'],
+        trials_needed=[int(t) for t in data['trials_needed']],
+        camera_name=data['camera_name'], camera_name_2=data['camera_name_2'],
+        pad_start=data['pad_start'], pad_end=data['pad_end'],
+        filter_method=data['filter_method'], filter_window_ms=data['filter_window_ms'],
+        filter_sigma_ms=data['filter_sigma_ms'], filter_polyorder=data['filter_polyorder'],
+        crop=list(crop), crop_2=list(crop_2) if crop_2 is not None else None,
+        clims=[float(c) for c in clims], clims_2=[float(c) for c in clims_2] if clims_2 is not None else None,
+        clim_pct=list(clim_pct), tail_s=tail_s, force_axis_limit=force_axis_limit, lang=lang,
+        video_fps=video_fps, playback_speed=playback_speed,
+        output_path=str(output_path),
+    )
+    params_path = Path(output_path).with_suffix('.json')
+    with open(params_path, 'w') as f:
+        json.dump(params, f, indent=2)
+    return params_path
+
+
+def load_render_params(params_path):
+    """Load a sidecar written by save_render_params(). See rerender_from_params to actually
+    redo the render from it rather than just inspecting the recorded parameters."""
+    with open(params_path) as f:
+        return json.load(f)
+
+
+def rerender_from_params(params_path, output_path=None):
+    """Recreate a video exactly as recorded by save_render_params().
+
+    output_path defaults to the original path (so the render overwrites it in place); pass a
+    different one to render a fresh copy alongside the original instead. Returns the new
+    (output_path, clims, clims_2) from render_trial_video.
+    """
+    params = load_render_params(params_path)
+    data = load_trial_video_data(
+        subject_id=params['subject_id'], session=params['session'], block=params['block'],
+        trial_start=params['trial_start'], trial_end=params['trial_end'],
+        camera_name=params['camera_name'], camera_name_2=params['camera_name_2'],
+        pad_start=params['pad_start'], pad_end=params['pad_end'],
+        filter_method=params['filter_method'], filter_window_ms=params['filter_window_ms'],
+        filter_sigma_ms=params['filter_sigma_ms'], filter_polyorder=params['filter_polyorder'])
+    return render_trial_video(
+        data, output_path or params['output_path'],
+        video_fps=params['video_fps'], playback_speed=params['playback_speed'],
+        crop=tuple(params['crop']), crop_2=tuple(params['crop_2']) if params['crop_2'] else None,
+        clims=np.array(params['clims']), clims_2=np.array(params['clims_2']) if params['clims_2'] else None,
+        clim_pct=tuple(params['clim_pct']), tail_s=params['tail_s'],
+        force_axis_limit=params['force_axis_limit'], lang=params['lang'])

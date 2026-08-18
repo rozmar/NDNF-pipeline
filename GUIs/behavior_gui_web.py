@@ -810,7 +810,11 @@ class VideoGenerationTab:
         return dict(subject_id=subject_id, session=session, block=self._inherited_block,
                     trial_start=self._inherited_trial_start, trial_end=self._inherited_trial_end,
                     camera_name=camera, camera_name_2=camera_2,
-                    pad_start=self.pad_start.value or 1.0, pad_end=self.pad_end.value or 1.0)
+                    pad_start=self.pad_start.value or 1.0, pad_end=self.pad_end.value or 1.0,
+                    # same shared trace-filter control used by Session Overview / Block Detail,
+                    # so the video's trace is smoothed the same way as whatever you were just
+                    # looking at there - see load_trial_video_data's filter_method docs
+                    **self.app.filter_controls.get_filter_kwargs())
 
     def _render_kwargs(self):
         return dict(
@@ -951,11 +955,16 @@ class VideoGenerationTab:
 
         def work():
             try:
-                from ndnf_pipeline.plot.videography_plots import load_trial_video_data, render_trial_video
+                from ndnf_pipeline.plot.videography_plots import (
+                    load_trial_video_data, render_trial_video, save_render_params)
                 data = load_trial_video_data(**params)
-                render_trial_video(data, output_path, video_fps=fps, playback_speed=speed,
-                                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
-                self._render_queue.put(("done", output_path))
+                _, used_clims, used_clims_2 = render_trial_video(
+                    data, output_path, video_fps=fps, playback_speed=speed,
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
+                params_path = save_render_params(
+                    data, output_path, video_fps=fps, playback_speed=speed,
+                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
+                self._render_queue.put(("done", (output_path, params_path)))
             except Exception as exc:
                 self._render_queue.put(("error", exc))
 
@@ -972,8 +981,10 @@ class VideoGenerationTab:
         self.render_progress.visible = False
         self.render_btn.disabled = False
         if status == "done":
-            self.app.status.object = f"Video saved: {payload}"
-            pn.state.notifications.success(f"Video saved:\n{payload}", duration=0)
+            output_path, params_path = payload
+            self.app.status.object = f"Video saved: {output_path}  (params: {params_path})"
+            pn.state.notifications.success(f"Video saved:\n{output_path}\n\nParams saved:\n{params_path}",
+                                            duration=0)
         else:
             self.app.status.object = "Render failed - see error notification."
             self.app.report_error(payload)
@@ -1203,7 +1214,12 @@ class BehaviorGUI:
         self.status.object = "Ready."
 
     def report_error(self, exc):
-        traceback.print_exc()
+        # traceback.print_exc() would print nothing useful here ("NoneType: None"): it reads
+        # the *currently being handled* exception, but errors from the video-render worker
+        # thread arrive here later, via the render queue, from inside a periodic callback with
+        # no exception in flight - exc.__traceback__ is preserved on the exception object
+        # itself regardless of which thread/context it's reported from, so use that instead.
+        traceback.print_exception(exc)
         pn.state.notifications.error(str(exc), duration=0)
 
 
