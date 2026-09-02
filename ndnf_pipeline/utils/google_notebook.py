@@ -91,9 +91,7 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
             temp = _call_with_retry(wb.values_get, sheet_title+'!A1:OO10000', params)
             temp = temp['values']
             header = temp.pop(0)
-            data = list()
-            for row in temp:
-                data.append(row)
+            data = _pad_rows(temp, len(header))
             df = pd.DataFrame(data, columns = header)
             return df
         else:
@@ -103,6 +101,15 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
 
 def _hash_sheet_values(values):
     return hashlib.sha256(json.dumps(values).encode('utf-8')).hexdigest()
+
+def _pad_rows(rows, width):
+    """
+    The Sheets API trims each returned row to its last non-empty cell, so
+    rows with trailing blank cells come back shorter than the header row.
+    Pad them back out so they line up with the header before building a
+    DataFrame.
+    """
+    return [row + [''] * (width - len(row)) for row in rows]
 
 def update_metadata(notebook_name, metadata_dir, google_creds_json):
     """
@@ -152,7 +159,8 @@ def update_metadata(notebook_name, metadata_dir, google_creds_json):
             archive_fname = '{}.csv'.format(
                 datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S'))
 
-        df = pd.DataFrame(values[1:], columns=values[0])
+        header = values[0]
+        df = pd.DataFrame(_pad_rows(values[1:], len(header)), columns=header)
         df.to_csv(os.path.join(metadata_dir, f'{notebook_name}_{title}.csv'))
         archive_path = os.path.join(metadata_dir, 'archive', f'{notebook_name}_{title}')
         Path(archive_path).mkdir(parents=True, exist_ok=True)
