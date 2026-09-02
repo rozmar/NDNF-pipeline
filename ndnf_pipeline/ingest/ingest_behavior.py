@@ -28,6 +28,11 @@ def _is_valid_training_type(value):
     value = str(value).strip()
     return value not in ('', '-') and value.lower() != 'none'
 
+def _is_habituation_training_type(value):
+    if pd.isna(value):
+        return False
+    return 'habituation' in str(value).strip().lower()
+
 def _first_non_empty(*values):
     for value in values:
         if pd.isna(value):
@@ -146,6 +151,7 @@ def ingest_behavior_sessions(dj):
                     'water_earned': _to_float_or_none(row['Water during experiment']),
                     'water_extra': _to_float_or_none(row['Extra water']),
                     'comment': row['Comment'],
+                    'training_type': row['Training type'],
                 })
 
         known_dates = {sr['session_date'] for sr in session_rows}
@@ -173,6 +179,7 @@ def ingest_behavior_sessions(dj):
                 'water_earned': _to_float_or_none(row['Water earned during the task (ml)']),
                 'water_extra': _to_float_or_none(row['Water given (ml)']),
                 'comment': _first_non_empty(row.get('Behavior notes'), row.get('Notes')),
+                'training_type': row['Training type'],
             })
 
         if not session_rows:
@@ -280,6 +287,9 @@ def ingest_behavior_sessions(dj):
             if len(matching_trials)>0:
                 print('trials already ingested for session {}, skipping'.format(session_dict))
                 continue
+            #if _is_habituation_training_type(session_row.get('training_type')):
+                #print('session {} is a habituation session, skipping trial ingestion'.format(session_dict))
+                #continue
             # get load cell calibration
             calibration_dates_all = (lab.Device.DeviceCalibration() &{'rig':rig,'device':'LoadCell'}).fetch('calibration_date')
             calibration_dates = calibration_dates_all[(calibration_dates_all-session_date)<timedelta(0)]
@@ -309,6 +319,8 @@ def ingest_behavior_sessions(dj):
             reward_position_dict_list = []
 
             session_zero_time = None
+            first_file_wall_datetime = None
+            previous_file_last_end_time = None
             video_recording_cameras = set()   # (rig, device) pairs seen this session
             video_file_dicts = []
             video_frametimes_raw = []         # list of (vf_dict, raw_frametimes)
@@ -338,14 +350,48 @@ def ingest_behavior_sessions(dj):
 
                 data_dict = {}
                 for file in os.listdir(os.path.join(session_dir,'behavior/SoftwareEvents/')):
-                    with open(os.path.join(session_dir,'behavior/SoftwareEvents/',file)) as f:
+                    softwareevents_path = os.path.join(session_dir,'behavior/SoftwareEvents/',file)
+                    with open(softwareevents_path) as f:
                         list_now = []
-                        for line in f:
+                        for line_number, line in enumerate(f, start=1):
                             line = line.replace('null','None')
                             line = line.replace('false','False')
                             line = line.replace('true','True')
-                            list_now.append(eval(line))
+                            try:
+                                list_now.append(eval(line))
+                            except SyntaxError:
+                                print('Could not parse line {} of {}, skipping line. Content: {!r}'.format(
+                                    line_number, softwareevents_path, line))
+                                continue
                         data_dict[file[:-5]] = list_now
+
+                # A later SoftwareEvents file's raw timestamps are either (a) continuous with
+                # the first file's - same clock never stopped, e.g. the log just rolled over
+                # to a new file - and so already directly comparable, or (b) reset to ~0
+                # because the underlying clock (e.g. the Harp device) was restarted between
+                # recordings. Detect which case we're in: taken at face value (offset 0),
+                # this file's first trial can only land before the previous file's last trial
+                # ended if the clock reset - a continuous clock is monotonic by construction.
+                # Only in the reset case do we correct it, by anchoring this file's zero to
+                # the real wall-clock gap between when each file's recording started (parsed
+                # from the session folder name).
+                file_wall_datetime = datetime.combine(session_folder_dates[mi], session_folder_times[mi])
+                first_trial_raw = data_dict['Trial'][0]['timestamp'] if data_dict.get('Trial') else None
+
+                if session_zero_time is None:
+                    # tentative anchor: this file may still get skipped below (missing keys,
+                    # no behavior folder), in which case the next candidate file overwrites it
+                    first_file_wall_datetime = file_wall_datetime
+                    block_time_offset = 0.0
+                elif first_trial_raw is None or (first_trial_raw - session_zero_time) >= previous_file_last_end_time:
+                    # clock is continuous with the first file - raw timestamps are already
+                    # directly comparable, no correction needed
+                    block_time_offset = 0.0
+                else:
+                    # clock reset for this file: raw timestamps restart near 0
+                    wall_gap = (file_wall_datetime - first_file_wall_datetime).total_seconds()
+                    block_time_offset = wall_gap + session_zero_time
+
                 if data_version == 'v1':
                     if 'TrialOutcome' not in data_dict.keys():
                         print('No TrialOutcome found in data_dict keys for session {},skipping'.format(session_dict))
@@ -412,7 +458,7 @@ def ingest_behavior_sessions(dj):
                             'n_frames':      len(raw_frametimes),
                         }
                         video_file_dicts.append(vf_dict)
-                        video_frametimes_raw.append((vf_dict, raw_frametimes))
+                        video_frametimes_raw.append((vf_dict, raw_frametimes, block_time_offset))
 
                 # per-session baseline: raw ADC value logged by the rig at zero force
                 lc_baseline_per_axis = {}
@@ -455,7 +501,7 @@ def ingest_behavior_sessions(dj):
                 if data_version == 'v1':##############TODO FIX THIS!!!
                     feedback_type = '1D_speed'
                 else:
-                    if subject_id in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith','mouse_rozmar','M013','M014','M015','M016','M017','M018','M019','M020','M021','M022','M023','M024','M025','M026','M027','M028','M029','M030']:
+                    if 'human' not in  subject_id:# in ['M001','M002','M003','M004','M005','M006','mouse_bbenjamin','mouse_judith','mouse_rozmar','M013','M014','M015','M016','M017','M018','M019','M020','M021','M022','M023','M024','M025','M026','M027','M028','M029','M030','M031','M032','M033','M034','M035']:
                         feedback_type = '1D_speed'
                     else:
                         if '1d' in session_info_dict['notes'].lower():
@@ -476,20 +522,26 @@ def ingest_behavior_sessions(dj):
                             if subject_id in df_task_protocol_metadata['subject'].values:
                                 feedback_type = '1D_speed'
                             else:
-                                asdasd
-                        
+                                raise ValueError(
+                                    "Could not determine feedback_type for subject_id={!r}, session={!r}. "
+                                    "Notes={!r} did not contain '1d'/'2d'/'no feedback', subject is not in the "
+                                    "hardcoded 1D_speed list, and subject is not in "
+                                    "'NDNF behavior notes_Task_protocol_metadata.csv'. "
+                                    "Add this subject to one of those sources.".format(
+                                        subject_id, session_dict.get('session'), session_info_dict['notes']))
+
                 go_cue_timestamps = [t['timestamp'] for t in data_dict['ResponsePeriod']]
                 go_cue_timestamps = np.array(go_cue_timestamps)
 
                 # --- assign each trial to the block that was actually active when it started ---
                 # (v1 sessions, and any session without an ActiveBlock event, are treated as one
                 # single block using the declared block_statistics, exactly as before)
-                if data_version in ('v2', 'v3') and 'ActiveBlock' in data_dict:
+                if data_version in ('v2', 'v3') and data_dict.get('ActiveBlock'):
                     active_block_events = data_dict['ActiveBlock']
                 else:
                     active_block_events = [{
                         'timestamp': -np.inf,
-                        'data': {'trial_statistics': tasklogic_dict['task_parameters']['environment']['block_statistics'][0]},
+                        'data': {'trial_statistics': tasklogic_dict['task_parameters']['environment']['block_statistics'][0]['trial_statistics']},
                     }]
                 block_start_times = np.array([be['timestamp'] for be in active_block_events])
                 all_trial_times = np.array([t['timestamp'] for t in data_dict['Trial']])
@@ -618,8 +670,8 @@ def ingest_behavior_sessions(dj):
                     sessiontrial_dict = {'subject_id':subject_id,
                                         'session':session_dict['session'],
                                         'trial':trial_i+trials_so_far,
-                                        'trial_start_time':trial_start_time-session_zero_time,
-                                        'trial_end_time': trial_end_time-session_zero_time }
+                                        'trial_start_time':trial_start_time+block_time_offset-session_zero_time,
+                                        'trial_end_time': trial_end_time+block_time_offset-session_zero_time }
                     sessiontrial_dict_list.append(sessiontrial_dict)
                     behaviortrial_dict = {'subject_id': sessiontrial_dict['subject_id'],
                                         'session':sessiontrial_dict['session'],
@@ -630,7 +682,7 @@ def ingest_behavior_sessions(dj):
                     #%
                     # calculate lick lengths
                     lick_length = np.zeros(len(lickometer_data))*np.nan
-                    for i in range(len(lickometer_data)):
+                    for i in range(len(lickometer_data)-1):
                         if lickometer_data[0].values[i]==1:
                             lick_length[i] = lickometer_data.index.values[i+1]-lickometer_data.index.values[i]
                     lickometer_data['lick_length'] = lick_length
@@ -749,6 +801,8 @@ def ingest_behavior_sessions(dj):
                     trials_so_far += trial_i+1 # for multiple files in a given session
                 _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
                                  current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
+                if sessiontrial_dict_list:
+                    previous_file_last_end_time = sessiontrial_dict_list[-1]['trial_end_time']
             #% finally, do the insertion
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
@@ -767,10 +821,10 @@ def ingest_behavior_sessions(dj):
                                 for r, cam in video_recording_cameras]
                     videography.VideoRecording().insert(vr_dicts, skip_duplicates=True)
                     videography.VideoFile().insert(video_file_dicts, skip_duplicates=True)
-                    for vf_dict, raw_ft in video_frametimes_raw:
+                    for vf_dict, raw_ft, vf_block_time_offset in video_frametimes_raw:
                         vf_key = {k: vf_dict[k] for k in ['subject_id', 'session', 'rig', 'device', 'video_file_idx']}
                         videography.VideoFileFrameTimes().insert1(
-                            {**vf_key, 'frame_times': raw_ft - session_zero_time},
+                            {**vf_key, 'frame_times': raw_ft + vf_block_time_offset - session_zero_time},
                             skip_duplicates=True)
                 dj.conn().ping()
                 

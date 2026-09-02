@@ -8,9 +8,42 @@ import os
 import numpy as np# use creds to create a client to interact with the Google Drive API
 import json
 import hashlib
+import random
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Google API status codes worth retrying (transient server-side issues, not
+# auth/permission/not-found errors, which won't be fixed by retrying).
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_api_error(exc):
+    if not isinstance(exc, gspread.exceptions.APIError):
+        return False
+    try:
+        status = exc.response.status_code
+    except AttributeError:
+        status = None
+    return status in _RETRYABLE_STATUS_CODES
+
+
+def _call_with_retry(func, *args, max_retries=5, base_delay=2, **kwargs):
+    """
+    Call func(*args, **kwargs), retrying with exponential backoff on
+    transient Google API errors (e.g. 503 Service Unavailable) instead of
+    letting them bubble up and hang/crash the script.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as exc:
+            if attempt == max_retries or not _is_retryable_api_error(exc):
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            print(f'Google API error ({exc}), retrying in {delay:.1f}s '
+                  f'(attempt {attempt + 1}/{max_retries})')
+            time.sleep(delay)
 
 
 def create_client(google_creds_json):
@@ -28,25 +61,26 @@ def fetch_lastmodify_time(spreadsheetname,client,creds):
     modifiedtime = None
     ID = None
     service = build('drive', 'v3', credentials=creds)
-    wb = client.open(spreadsheetname)
+    wb = _call_with_retry(client.open, spreadsheetname)
     ID = wb.id
     if ID:
-        modifiedtime = service.files().get(fileId = ID,fields = 'modifiedTime').execute()
+        modifiedtime = _call_with_retry(
+            service.files().get(fileId=ID, fields='modifiedTime').execute)
     return modifiedtime
 
 def fetch_sheet_titles(spreadsheetname,client):
-    wb = client.open(spreadsheetname)
+    wb = _call_with_retry(client.open, spreadsheetname)
     sheetnames = list()
-    worksheets = wb.worksheets()
+    worksheets = _call_with_retry(wb.worksheets)
     for sheet in worksheets:
         sheetnames.append(sheet.title)
     return sheetnames
 
 def fetch_sheet(spreadsheet_name,sheet_title,client):
     #%%
-    wb = client.open(spreadsheet_name)
+    wb = _call_with_retry(client.open, spreadsheet_name)
     sheetnames = list()
-    worksheets = wb.worksheets()
+    worksheets = _call_with_retry(wb.worksheets)
     for sheet in worksheets:
         sheetnames.append(sheet.title)
     if sheet_title in sheetnames:
@@ -54,12 +88,10 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
         idx_now = sheetnames.index(sheet_title)
         if idx_now > -1:
             params = {'majorDimension':'ROWS'}
-            temp = wb.values_get(sheet_title+'!A1:OO10000',params)
+            temp = _call_with_retry(wb.values_get, sheet_title+'!A1:OO10000', params)
             temp = temp['values']
             header = temp.pop(0)
-            data = list()
-            for row in temp:
-                data.append(row)
+            data = _pad_rows(temp, len(header))
             df = pd.DataFrame(data, columns = header)
             return df
         else:
@@ -69,6 +101,15 @@ def fetch_sheet(spreadsheet_name,sheet_title,client):
 
 def _hash_sheet_values(values):
     return hashlib.sha256(json.dumps(values).encode('utf-8')).hexdigest()
+
+def _pad_rows(rows, width):
+    """
+    The Sheets API trims each returned row to its last non-empty cell, so
+    rows with trailing blank cells come back shorter than the header row.
+    Pad them back out so they line up with the header before building a
+    DataFrame.
+    """
+    return [row + [''] * (width - len(row)) for row in rows]
 
 def update_metadata(notebook_name, metadata_dir, google_creds_json):
     """
@@ -86,12 +127,14 @@ def update_metadata(notebook_name, metadata_dir, google_creds_json):
     _, client = create_client(google_creds_json)
 
     # Open spreadsheet once and reuse
-    wb = client.open(notebook_name)
+    wb = _call_with_retry(client.open, notebook_name)
 
     # Get all sheet titles in one call, then fetch all data in one batch call
-    sheet_titles = [ws.title for ws in wb.worksheets()]
+    worksheets = _call_with_retry(wb.worksheets)
+    sheet_titles = [ws.title for ws in worksheets]
     ranges = [f"{title}!A1:OO10000" for title in sheet_titles]
-    batch_result = wb.values_batch_get(ranges, params={'majorDimension': 'ROWS'})
+    batch_result = _call_with_retry(
+        wb.values_batch_get, ranges, params={'majorDimension': 'ROWS'})
 
     hashes_file_name = notebook_name.replace(' ', '_') + '_sheet_hashes.json'
     hashes_path = os.path.join(metadata_dir, hashes_file_name)
@@ -116,7 +159,8 @@ def update_metadata(notebook_name, metadata_dir, google_creds_json):
             archive_fname = '{}.csv'.format(
                 datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S'))
 
-        df = pd.DataFrame(values[1:], columns=values[0])
+        header = values[0]
+        df = pd.DataFrame(_pad_rows(values[1:], len(header)), columns=header)
         df.to_csv(os.path.join(metadata_dir, f'{notebook_name}_{title}.csv'))
         archive_path = os.path.join(metadata_dir, 'archive', f'{notebook_name}_{title}')
         Path(archive_path).mkdir(parents=True, exist_ok=True)
