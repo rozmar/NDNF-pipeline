@@ -669,8 +669,16 @@ class VideoGenerationTab:
         self.speed = pn.widgets.FloatInput(name="speed", value=1.0, width=70)
         self.fps = pn.widgets.IntInput(name="fps", value=20, width=70)
         self.lang = pn.widgets.Select(name="lang", options=["en", "hu"], value="en", width=70)
+        # imported here (not at module load) to match this tab's other lazy ndnf_pipeline
+        # imports below - just a plain dict, so it doesn't actually need a DataJoint connection
+        from ndnf_pipeline.plot.videography_plots import VIDEO_QUALITY_PRESETS, VIDEO_QUALITY_DEFAULT
+        self._quality_presets = VIDEO_QUALITY_PRESETS
+        self.quality_select = pn.widgets.Select(name="quality", options=list(VIDEO_QUALITY_PRESETS.keys()),
+                                                  value=VIDEO_QUALITY_DEFAULT, width=90)
+        self.quality_select.param.watch(self._update_default_filename, "value")
         params_row = pn.Row(self.pad_start, self.pad_end, self.tail, self.force_limit,
-                             self.clim_low, self.clim_high, self.speed, self.fps, self.lang)
+                             self.clim_low, self.clim_high, self.speed, self.fps, self.lang,
+                             self.quality_select)
 
         # --- crop tool (camera 1) ---
         self.crop_label = {1: pn.widgets.StaticText(value="crop: left=0 right=0 top=0 bottom=0"),
@@ -711,7 +719,8 @@ class VideoGenerationTab:
         self.output_dir_input = pn.widgets.TextInput(name="Output folder", width=340)
         cfg = dj_connection.load_gui_config()
         self.output_dir_input.value = cfg.get("video_output_dir") or "/home/coder/project/Videos"
-        self.output_name_input = pn.widgets.TextInput(name="Output filename", value="video.mp4", width=260)
+        self.output_name_input = pn.widgets.TextInput(
+            name="Output filename", value=f"video_{self.quality_select.value}.mp4", width=260)
         self._last_auto_name = self.output_name_input.value
 
         self.render_btn = pn.widgets.Button(name="Render video", button_type="primary", width=120)
@@ -819,10 +828,12 @@ class VideoGenerationTab:
         camera_suffix = camera
         if self.use_camera_2.value and self.camera_2_select.value:
             camera_suffix = f"{camera}+{self.camera_2_select.value}"
+        quality = self.quality_select.value
         if subject_id and session is not None and self._inherited_block is not None and camera:
             return (f"{subject_id}_s{session}_b{self._inherited_block}_"
-                    f"t{self._inherited_trial_start}-{self._inherited_trial_end}_{camera_suffix}.mp4")
-        return "video.mp4"
+                    f"t{self._inherited_trial_start}-{self._inherited_trial_end}_"
+                    f"{camera_suffix}_{quality}.mp4")
+        return f"video_{quality}.mp4"
 
     def _update_default_filename(self, *_):
         """Keep the filename field auto-populated as block/trial/camera selection changes,
@@ -865,12 +876,16 @@ class VideoGenerationTab:
                     # looking at there - see load_trial_video_data's filter_method docs
                     **self.app.filter_controls.get_filter_kwargs())
 
+    def _quality_preset(self):
+        return self._quality_presets.get(self.quality_select.value, self._quality_presets['high'])
+
     def _render_kwargs(self):
         return dict(
             clim_pct=(self.clim_low.value or 0, self.clim_high.value or 95),
             tail_s=self.tail.value or 5,
             force_axis_limit=self.force_limit.value or 10.0,
             lang=self.lang.value or "en",
+            dpi=self._quality_preset()['dpi'],
         )
 
     # --- crop tool ---
@@ -986,6 +1001,7 @@ class VideoGenerationTab:
         if params is None:
             return
         render_kwargs = self._render_kwargs()
+        bitrate = self._quality_preset()['bitrate']
         speed = self.speed.value or 1.0
         fps = self.fps.value or 20
         crop = self._cam[1]["crop"]
@@ -1014,13 +1030,14 @@ class VideoGenerationTab:
                 # via add_periodic_callback) is what actually touches the render_progress widget
                 _, used_clims, used_clims_2 = render_trial_video(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2,
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, bitrate=bitrate,
                     progress_callback=lambda n_done, n_total: setattr(
                         self, '_render_progress_state', (n_done, n_total)),
                     **render_kwargs)
                 params_path = save_render_params(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
+                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2,
+                    bitrate=bitrate, **render_kwargs)
                 self._render_queue.put(("done", (output_path, params_path)))
             except Exception as exc:
                 self._render_queue.put(("error", exc))

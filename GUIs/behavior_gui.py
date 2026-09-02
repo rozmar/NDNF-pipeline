@@ -679,6 +679,11 @@ class VideoGenerationTab(ttk.Frame):
         self.speed_var = tk.StringVar(value="1.0")
         self.fps_var = tk.StringVar(value="20")
         self.lang_var = tk.StringVar(value="en")
+        # imported here (not at module load) to match this tab's other lazy ndnf_pipeline
+        # imports below - just a plain dict, so it doesn't actually need a DataJoint connection
+        from ndnf_pipeline.plot.videography_plots import VIDEO_QUALITY_PRESETS, VIDEO_QUALITY_DEFAULT
+        self._quality_presets = VIDEO_QUALITY_PRESETS
+        self.quality_var = tk.StringVar(value=VIDEO_QUALITY_DEFAULT)
 
         def _labeled_entry(parent, label, var, width=5):
             ttk.Label(parent, text=label).pack(side="left")
@@ -694,7 +699,10 @@ class VideoGenerationTab(ttk.Frame):
         _labeled_entry(params, "fps:", self.fps_var, width=4)
         ttk.Label(params, text="lang:").pack(side="left")
         ttk.Combobox(params, textvariable=self.lang_var, state="readonly", width=4,
-                     values=["en", "hu"]).pack(side="left", padx=(2, 0))
+                     values=["en", "hu"]).pack(side="left", padx=(2, 10))
+        ttk.Label(params, text="quality:").pack(side="left")
+        ttk.Combobox(params, textvariable=self.quality_var, state="readonly", width=8,
+                     values=list(self._quality_presets.keys())).pack(side="left", padx=(2, 0))
 
         actions_cam1 = ttk.Frame(self)
         actions_cam1.pack(fill="x", padx=5, pady=(4, 2))
@@ -879,12 +887,16 @@ class VideoGenerationTab(ttk.Frame):
                     # looking at there - see load_trial_video_data's filter_method docs
                     **self.app.filter_controls.get_filter_kwargs())
 
+    def _quality_preset(self):
+        return self._quality_presets.get(self.quality_var.get(), self._quality_presets['high'])
+
     def _render_kwargs(self):
         return dict(
             clim_pct=(self._read_float(self.clim_low_var, 0), self._read_float(self.clim_high_var, 95)),
             tail_s=self._read_float(self.tail_var, 5),
             force_axis_limit=self._read_float(self.force_limit_var, 10.0),
             lang=self.lang_var.get() or "en",
+            dpi=self._quality_preset()['dpi'],
         )
 
     # --- actions ---
@@ -1004,10 +1016,12 @@ class VideoGenerationTab(ttk.Frame):
         camera_suffix = camera
         if self.use_camera_2.get() and self.camera_2_var.get():
             camera_suffix = f"{camera}+{self.camera_2_var.get()}"
-        default_name = "video.mp4"
+        quality = self.quality_var.get()
+        default_name = f"video_{quality}.mp4"
         if subject_id and session is not None and self._inherited_block is not None and camera:
             default_name = (f"{subject_id}_s{session}_b{self._inherited_block}_"
-                             f"t{self._inherited_trial_start}-{self._inherited_trial_end}_{camera_suffix}.mp4")
+                             f"t{self._inherited_trial_start}-{self._inherited_trial_end}_"
+                             f"{camera_suffix}_{quality}.mp4")
         cfg = dj_connection.load_gui_config()
         initial_dir = cfg.get("video_output_dir") or str(Path.home())
         path = filedialog.asksaveasfilename(
@@ -1028,6 +1042,7 @@ class VideoGenerationTab(ttk.Frame):
         if params is None:
             return
         render_kwargs = self._render_kwargs()
+        bitrate = self._quality_preset()['bitrate']
         speed = self._read_float(self.speed_var, 1.0)
         fps = self._read_int(self.fps_var, 20)
         crop = self._cam[1]["crop"]
@@ -1052,13 +1067,14 @@ class VideoGenerationTab(ttk.Frame):
                 # actually touches the render_progress widget
                 _, used_clims, used_clims_2 = render_trial_video(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2,
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, bitrate=bitrate,
                     progress_callback=lambda n_done, n_total: setattr(
                         self, '_render_progress_state', (n_done, n_total)),
                     **render_kwargs)
                 params_path = save_render_params(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
+                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2,
+                    bitrate=bitrate, **render_kwargs)
                 self._render_queue.put(("done", (output_path, params_path)))
             except Exception as exc:
                 self._render_queue.put(("error", exc))
