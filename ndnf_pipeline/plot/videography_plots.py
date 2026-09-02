@@ -15,6 +15,21 @@ from ndnf_pipeline.plot.behavior_plots import (
     FILTER_METHODS, _filter_trace, _estimate_sample_interval, ms_to_samples, ms_to_samples_float,
     _get_block_force_axes, _normalize_lut, _pad_lut_to_range)
 
+# Quality presets for the "Generate Video" GUIs. dpi is the dominant cost of rendering (it sets
+# how many pixels each frame is rasterized at in _render_frame_chunk's savefig call - the
+# CPU-bound step render_trial_video parallelizes across workers), so 'low' renders much faster
+# than 'high'; bitrate only affects the final ffmpeg encode's file size/quality at that
+# resolution. 'high' matches what render_trial_video/save_render_params/preview_last_frame have
+# always defaulted to, so it reproduces exactly what every render looked like before this preset
+# dropdown existed.
+VIDEO_QUALITY_PRESETS = {
+    'low':    dict(dpi=80,  bitrate='1200k'),
+    'medium': dict(dpi=110, bitrate='2000k'),
+    'high':   dict(dpi=150, bitrate='3000k'),
+    'ultra':  dict(dpi=220, bitrate='6000k'),
+}
+VIDEO_QUALITY_DEFAULT = 'high'
+
 _LABELS = {
     'en': dict(time='Time (s)', feedback='Feedback',
                fb_start='start', fb_target='target',
@@ -751,8 +766,8 @@ def _render_frame_chunk(data, crop, clims, tail_s, force_axis_limit, lang, crop_
 
 def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop=(0, 0, 0, 0),
                         clims=None, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
-                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, n_workers=None,
-                        progress_callback=None):
+                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, bitrate='3000k',
+                        n_workers=None, progress_callback=None):
     """Render and stitch the full trial-range video with ffmpeg.
 
     Returns (output_path, clims, clims_2): the clims/clims_2 actually used, which is either
@@ -781,6 +796,10 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     with n_done=0 right before rendering starts and once with n_done==n_total right after the
     last frame is written (before the ffmpeg stitch, which isn't tracked per-frame). If not
     given, the same (n_done, n_total) progression is printed to stdout instead.
+
+    dpi/bitrate together set output quality; see VIDEO_QUALITY_PRESETS for the low/medium/high/
+    ultra presets the GUIs offer (dpi is by far the bigger lever on render *time*, since it's the
+    pixel count each worker rasterizes per frame - bitrate only costs ffmpeg's final encode pass).
     """
     if clims is None:
         last_frame = _read_last_frame(data['video_file_path'], data['frame_abs_indices'][-1])
@@ -857,7 +876,7 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
             # frame PNGs' pixel size comes from figsize*dpi and isn't guaranteed to land on an
             # even number (more likely with a second stacked camera row) -- trim to even here
             '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-            '-r', str(video_fps), '-pix_fmt', 'yuv420p', '-b:v', '3000k',
+            '-r', str(video_fps), '-pix_fmt', 'yuv420p', '-b:v', bitrate,
             output_path
         ], check=True)
         print(f'Done: {output_path}')
@@ -869,7 +888,7 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
 
 def save_render_params(data, output_path, video_fps, playback_speed, crop, clims,
                         clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
-                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150):
+                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, bitrate='3000k'):
     """Write a JSON sidecar next to output_path recording every parameter needed to exactly
     reproduce this render: which subject/session/block/trials/camera(s), the trace filter,
     crop, and brightness settings actually used.
@@ -892,8 +911,8 @@ def save_render_params(data, output_path, video_fps, playback_speed, crop, clims
         crop=list(crop), crop_2=list(crop_2) if crop_2 is not None else None,
         clims=[float(c) for c in clims], clims_2=[float(c) for c in clims_2] if clims_2 is not None else None,
         clim_pct=list(clim_pct), tail_s=tail_s, force_axis_limit=force_axis_limit, lang=lang,
-        lut_alpha=lut_alpha, dpi=dpi, video_fps=video_fps, playback_speed=playback_speed,
-        output_path=str(output_path),
+        lut_alpha=lut_alpha, dpi=dpi, bitrate=bitrate, video_fps=video_fps,
+        playback_speed=playback_speed, output_path=str(output_path),
     )
     params_path = Path(output_path).with_suffix('.json')
     with open(params_path, 'w') as f:
@@ -930,5 +949,7 @@ def rerender_from_params(params_path, output_path=None):
         clims=np.array(params['clims']), clims_2=np.array(params['clims_2']) if params['clims_2'] else None,
         clim_pct=tuple(params['clim_pct']), tail_s=params['tail_s'],
         force_axis_limit=params['force_axis_limit'], lang=params['lang'],
-        # .get: older sidecars predate lut_alpha/dpi, fall back to the same defaults render_trial_video uses
-        lut_alpha=params.get('lut_alpha', 0.25), dpi=params.get('dpi', 150))
+        # .get: older sidecars predate lut_alpha/dpi/bitrate, fall back to the same defaults
+        # render_trial_video uses
+        lut_alpha=params.get('lut_alpha', 0.25), dpi=params.get('dpi', 150),
+        bitrate=params.get('bitrate', '3000k'))
