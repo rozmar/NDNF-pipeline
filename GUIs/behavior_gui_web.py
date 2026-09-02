@@ -620,6 +620,7 @@ class VideoGenerationTab:
         self._preview_clims_2 = None
         self._output_dir = None
         self._render_queue = queue.Queue()
+        self._render_progress_state = (0, 0)  # (n_done, n_total), written by the render thread
         self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
@@ -981,6 +982,8 @@ class VideoGenerationTab:
         self.render_btn.disabled = True
         self.render_progress.visible = True
         self.render_progress.active = True
+        self.render_progress.value = -1  # indeterminate until the first real (n_done, n_total) report arrives
+        self._render_progress_state = (0, 0)
         self.app.status.object = "Rendering video... this can take a while."
 
         def work():
@@ -988,9 +991,15 @@ class VideoGenerationTab:
                 from ndnf_pipeline.plot.videography_plots import (
                     load_trial_video_data, render_trial_video, save_render_params)
                 data = load_trial_video_data(**params)
+                # called from the render worker/polling thread, not Panel's event-loop thread -
+                # so it only stashes the numbers; _poll_render_queue (running on the event loop
+                # via add_periodic_callback) is what actually touches the render_progress widget
                 _, used_clims, used_clims_2 = render_trial_video(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2,
+                    progress_callback=lambda n_done, n_total: setattr(
+                        self, '_render_progress_state', (n_done, n_total)),
+                    **render_kwargs)
                 params_path = save_render_params(
                     data, output_path, video_fps=fps, playback_speed=speed,
                     crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
@@ -1002,6 +1011,11 @@ class VideoGenerationTab:
         self._poll_handle = pn.state.add_periodic_callback(self._poll_render_queue, period=300)
 
     def _poll_render_queue(self):
+        n_done, n_total = self._render_progress_state
+        if n_total > 0:
+            self.render_progress.active = False
+            self.render_progress.max = n_total
+            self.render_progress.value = n_done
         try:
             status, payload = self._render_queue.get_nowait()
         except queue.Empty:
@@ -1009,6 +1023,7 @@ class VideoGenerationTab:
         self._poll_handle.stop()
         self.render_progress.active = False
         self.render_progress.visible = False
+        self.render_progress.value = -1  # back to indeterminate default, ready for the next render
         self.render_btn.disabled = False
         if status == "done":
             output_path, params_path = payload

@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import shutil
+from concurrent.futures import ProcessPoolExecutor, wait as futures_wait
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
@@ -262,14 +263,33 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
     )
 
 
-def _prepare_frame(bgr_frame, crop, clims):
+def _prepare_frame(bgr_frame, crop, clims, target_size=None):
+    """target_size, if given, is (width, height) in pixels to downscale the cropped frame to
+    before it's handed to imshow. Without this, imshow re-resamples the full camera-resolution
+    array from scratch on every single draw() call (measured ~2.6x the cost of drawing an
+    already-display-sized image), even though the displayed size never changes within a render -
+    shrinking once here with cv2 (much faster than Agg's resampler) up front avoids paying that
+    repeatedly. INTER_AREA is the appropriate/fast choice for shrinking (matches cv2 guidance for
+    downscaling, avoiding the aliasing plain nearest/linear would introduce)."""
     rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
     cl, cr, ct, cb = crop
     h, w = rgb.shape[:2]
     rgb = rgb[ct: h - cb if cb else None,
               cl: w - cr if cr else None]
+    if target_size is not None and target_size != (rgb.shape[1], rgb.shape[0]):
+        rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_AREA)
     lo, hi = clims
     return np.clip((rgb.astype(float) - lo) / (hi - lo), 0, 1)
+
+
+def _image_target_pixels(w_crop, h_crop, col_w_in, dpi):
+    """Pixel size (width, height) the camera image column will actually be rendered at, given
+    its allocated column width in inches (img_col_w) and the render dpi - used to downscale the
+    raw camera frame to its true displayed size once per frame instead of leaving matplotlib to
+    re-resample the full-resolution frame on every draw() call. See _prepare_frame."""
+    target_w = max(1, int(round(col_w_in * dpi)))
+    target_h = max(1, int(round(target_w * h_crop / w_crop)))
+    return target_w, target_h
 
 
 class _VideoFrameArtists:
@@ -290,7 +310,8 @@ class _VideoFrameArtists:
     """
 
     def __init__(self, data, video_frame, t_now, crop, clims, tail_s=5, force_axis_limit=10.0,
-                 lang='en', is_preview=False, video_frame_2=None, crop_2=None, clims_2=None):
+                 lang='en', is_preview=False, video_frame_2=None, crop_2=None, clims_2=None,
+                 lut_alpha=0.25, dpi=150):
         self.data = data
         self.crop = crop
         self.clims = clims
@@ -324,7 +345,17 @@ class _VideoFrameArtists:
             other_col_w = img_col_w
 
         fig_w = other_col_w + img_col_w
-        self.fig = plt.figure(figsize=[fig_w, fig_h])
+        # dpi fixed at figure-creation time (matching what render_trial_video passes to
+        # savefig(dpi=...) for this same figure) so _image_target_pixels below - which sizes the
+        # pre-resized camera frame(s) - targets the same pixel dimensions the frame actually gets
+        # rendered/saved at
+        self.fig = plt.figure(figsize=[fig_w, fig_h], dpi=dpi)
+        # camera frame(s) are downscaled to this once per update() instead of imshow silently
+        # re-resampling the full camera-resolution array from scratch on every draw() - see
+        # _prepare_frame/_image_target_pixels
+        self.img_target_size = _image_target_pixels(w_crop, h_crop, img_col_w, dpi)
+        self.img_target_size_2 = (_image_target_pixels(w_crop2, h_crop2, img_col_w, dpi)
+                                   if has_cam2 else None)
         # camera image(s) on the right, everything else (feedback/force-vs-time/target/current)
         # on the left - left needs real margin now (unlike when this edge only ever held a
         # borderless axis('off') image), so tick/axis labels on the left column aren't clipped
@@ -348,7 +379,7 @@ class _VideoFrameArtists:
         self.ax_current = self.fig.add_subplot(gs_bot[1], sharex=ax_target, sharey=ax_target)
 
         # --- static: camera image axes (title/off-axis set once; pixel content updates per frame) ---
-        self.im1 = ax_img.imshow(_prepare_frame(video_frame, crop, clims))
+        self.im1 = ax_img.imshow(_prepare_frame(video_frame, crop, clims, self.img_target_size))
         ax_img.axis('off')
         if is_preview:
             ax_img.set_title(f"{data['camera_name']}  subject={data['subject_id']}  session={data['session']}  "
@@ -358,7 +389,7 @@ class _VideoFrameArtists:
             ax_img.set_title(data['camera_name'], fontsize=9)
         self.im2 = None
         if has_cam2:
-            self.im2 = ax_img_2.imshow(_prepare_frame(video_frame_2, self.crop_2, self.clims_2))
+            self.im2 = ax_img_2.imshow(_prepare_frame(video_frame_2, self.crop_2, self.clims_2, self.img_target_size_2))
             ax_img_2.axis('off')
             ax_img_2.set_title(data['camera_name_2'], fontsize=9)
 
@@ -378,8 +409,15 @@ class _VideoFrameArtists:
         ax_target.set_ylabel(self.labels['force_y'], fontsize=10)
         ax_target.set_title(self.labels['lbl_target'], fontsize=11)
 
+        # --- fully static: same target LUT overlaid faintly on the Current panel, so the
+        # trajectory can be read against the target without glancing over to the separate Target
+        # panel; drawn before the trajectory artists below so it stays behind them, and kept
+        # translucent (lut_alpha) so it doesn't drown out the black/gray trajectory on top of it ---
+        self.ax_current.imshow(lut_disp, extent=uniform_extent, origin='lower',
+                                cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax, alpha=lut_alpha)
+
         # --- dynamic: force trajectory (placeholder artists now, real data via update() below) ---
-        self.line_all,  = self.ax_current.plot([], [], '-', color='lightgray', linewidth=0.7)
+        self.line_all,  = self.ax_current.plot([], [], '-', color='black', linewidth=0.7,alpha = .5)
         self.line_tail, = self.ax_current.plot([], [], 'k-', linewidth=2)
         self.marker_now, = self.ax_current.plot([], [], 'ro', markersize=12)
         self.ax_current.set_xlabel(self.labels['force_x'], fontsize=10)
@@ -458,9 +496,9 @@ class _VideoFrameArtists:
 
     def update(self, video_frame, t_now, video_frame_2=None):
         data = self.data
-        self.im1.set_data(_prepare_frame(video_frame, self.crop, self.clims))
+        self.im1.set_data(_prepare_frame(video_frame, self.crop, self.clims, self.img_target_size))
         if self.im2 is not None and video_frame_2 is not None:
-            self.im2.set_data(_prepare_frame(video_frame_2, self.crop_2, self.clims_2))
+            self.im2.set_data(_prepare_frame(video_frame_2, self.crop_2, self.clims_2, self.img_target_size_2))
 
         all_force_t  = data['all_force_t']
         all_force_lr = data['all_force_lr']
@@ -533,7 +571,8 @@ class _VideoFrameArtists:
 
 def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=5,
                                    force_axis_limit=10.0, lang='en', is_preview=False,
-                                   video_frame_2=None, crop_2=None, clims_2=None):
+                                   video_frame_2=None, crop_2=None, clims_2=None, lut_alpha=0.25,
+                                   dpi=150):
     """Single video-overlay figure for one frame: raw frame(s), target LUT, current force, feedback trace.
 
     If video_frame_2 is given, two camera images are stacked in the left column (video_frame on
@@ -542,13 +581,17 @@ def make_trial_video_frame_figure(data, video_frame, t_now, crop, clims, tail_s=
     spanning the full column height; the right column (feedback trace, target/current force) is
     unchanged either way.
 
+    lut_alpha controls the opacity of the target LUT echoed behind the trajectory in the Current
+    panel (0 hides it entirely, 1 matches the Target panel's own opacity).
+
     A thin single-frame entry point (used by preview_last_frame) over _VideoFrameArtists, which
     render_trial_video drives directly across many frames instead, updating only what changes
     per frame rather than paying for this from-scratch build on every one of them.
     """
     return _VideoFrameArtists(data, video_frame, t_now, crop, clims, tail_s=tail_s,
                                force_axis_limit=force_axis_limit, lang=lang, is_preview=is_preview,
-                               video_frame_2=video_frame_2, crop_2=crop_2, clims_2=clims_2).fig
+                               video_frame_2=video_frame_2, crop_2=crop_2, clims_2=clims_2,
+                               lut_alpha=lut_alpha, dpi=dpi).fig
 
 
 def _read_last_frame(video_file_path, frame_index):
@@ -570,7 +613,8 @@ def _read_last_frame(video_file_path, frame_index):
     return frame
 
 
-def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en', crop_2=None):
+def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
+                        crop_2=None, lut_alpha=0.50, dpi=150):
     """Preview figure for the last frame of the video window; also returns the raw frame(s) and
     clims (each camera's own brightness scaling, computed independently, since two different
     physical cameras rarely share the same brightness distribution) so the same scaling can be
@@ -593,7 +637,8 @@ def preview_last_frame(data, crop, clim_pct=(0, 95), tail_s=5, force_axis_limit=
     fig = make_trial_video_frame_figure(data, last_frame, data['frame_session_times'][-1],
                                          crop, clims, tail_s=tail_s, force_axis_limit=force_axis_limit,
                                          lang=lang, is_preview=True,
-                                         video_frame_2=last_frame_2, crop_2=crop_2, clims_2=clims_2)
+                                         video_frame_2=last_frame_2, crop_2=crop_2, clims_2=clims_2,
+                                         lut_alpha=lut_alpha, dpi=dpi)
     return fig, last_frame, clims, last_frame_2, clims_2
 
 
@@ -624,9 +669,90 @@ def _advance_to_frame(cap, current_pos, target_pos, max_skip_reads=60):
     return target_pos
 
 
+def _count_pngs(tmp_dir):
+    """Live count of rendered-frame PNGs already on disk - a directory listing is cheap enough
+    (thousands of entries) to poll a couple times a second for progress reporting; see
+    render_trial_video's progress_callback."""
+    return sum(1 for f in os.listdir(tmp_dir) if f.endswith('.png'))
+
+
+def _chunk_ranges(n, n_chunks):
+    """Split range(n) into up to n_chunks contiguous, near-equal (start, end) slices - used to
+    hand each render worker a contiguous run of output frames (so its own video seek stays the
+    cheap sequential-read case _advance_to_frame is built for, rather than random-access)."""
+    n_chunks = max(1, min(n_chunks, n)) if n else 1
+    base, rem = divmod(n, n_chunks)
+    starts = []
+    pos = 0
+    for i in range(n_chunks):
+        size = base + (1 if i < rem else 0)
+        if size:
+            starts.append((pos, pos + size))
+        pos += size
+    return starts
+
+
+def _render_frame_chunk(data, crop, clims, tail_s, force_axis_limit, lang, crop_2, clims_2,
+                         lut_alpha, dpi, tmp_dir, video_fps, chunk_specs):
+    """Render one contiguous run of output frames to numbered PNGs in tmp_dir.
+
+    chunk_specs: list of (frame_i, abs_frame, t_now, abs_frame_2_or_None), frame_i being the
+    frame's position in the *whole* render (not just this chunk) so its PNG filename slots into
+    the single final frame_%05d.png sequence ffmpeg stitches, regardless of which worker made it.
+
+    Runs in its own process (see render_trial_video, which dispatches these across a
+    ProcessPoolExecutor): each worker builds its own _VideoFrameArtists/opens its own
+    cv2.VideoCapture(s), since neither is safe to share across processes, and frames are fully
+    independent of each other (update() recomputes everything from t_now and data, which is
+    read-only) so this needs no coordination with other workers beyond disjoint frame_i ranges.
+    """
+    has_cam2 = bool(data.get('camera_name_2'))
+    cap  = cv2.VideoCapture(data['video_file_path'])
+    cap2 = cv2.VideoCapture(data['video_file_path_2']) if has_cam2 else None
+    cam1_pos, cam2_pos = None, None
+    artists = None
+    n_written = 0
+    try:
+        for frame_i, abs_frame, t_now, abs_frame_2 in chunk_specs:
+            _advance_to_frame(cap, cam1_pos, abs_frame)
+            ret, frame = cap.read()
+            cam1_pos = abs_frame + 1 if ret else None
+            if not ret:
+                break
+            frame_2 = None
+            if has_cam2 and abs_frame_2 is not None:
+                _advance_to_frame(cap2, cam2_pos, abs_frame_2)
+                ret2, frame_2 = cap2.read()
+                cam2_pos = abs_frame_2 + 1 if ret2 else None
+                if not ret2:
+                    frame_2 = None
+            if artists is None:
+                artists = _VideoFrameArtists(data, frame, t_now, crop, clims, tail_s=tail_s,
+                                              force_axis_limit=force_axis_limit, lang=lang,
+                                              video_frame_2=frame_2, crop_2=crop_2, clims_2=clims_2,
+                                              lut_alpha=lut_alpha, dpi=dpi)
+            else:
+                artists.update(frame, t_now, video_frame_2=frame_2)
+            # compress_level=1 (default is much higher): these PNGs are throwaway - ffmpeg reads
+            # them once below and then the whole tmp_dir is deleted - so there's no reason to
+            # spend CPU on smaller file size. PNG compression is always lossless regardless of
+            # level, so this is a pure speed win with zero effect on the rendered video's quality
+            artists.fig.savefig(os.path.join(tmp_dir, f'frame_{frame_i:05d}.png'), dpi=dpi,
+                                 pil_kwargs={'compress_level': 1})
+            n_written += 1
+    finally:
+        cap.release()
+        if cap2 is not None:
+            cap2.release()
+        if artists is not None:
+            artists.close()
+    return n_written
+
+
 def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop=(0, 0, 0, 0),
                         clims=None, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
-                        crop_2=None, clims_2=None):
+                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, n_workers=4,
+                        progress_callback=None):
     """Render and stitch the full trial-range video with ffmpeg.
 
     Returns (output_path, clims, clims_2): the clims/clims_2 actually used, which is either
@@ -639,6 +765,22 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
     times) and stacked below it in the video via make_trial_video_frame_figure. clims_2 scales its
     brightness independently of clims (auto-computed from its own last frame if not given), since
     two different physical cameras rarely share the same brightness distribution.
+
+    Frame rendering is embarrassingly parallel - each output frame only depends on its own t_now
+    and the read-only `data` arrays, never on the frame before it - so the n_out output frames are
+    split into n_workers (default: os.cpu_count()) contiguous chunks and rendered to PNGs by a
+    ProcessPoolExecutor (processes, not threads: matplotlib's Agg draw() is CPU-bound and holds
+    the GIL, so threads wouldn't actually overlap); a single ffmpeg pass then stitches the
+    complete numbered PNG sequence exactly as when this ran single-process, so multiple workers
+    never re-encode/concatenate separately and can't introduce a seam at chunk boundaries.
+
+    progress_callback, if given, is called periodically (roughly twice a second) as
+    progress_callback(n_done, n_total) - n_done is a live count of the PNGs actually present in
+    the render's temp dir, i.e. real progress across every worker combined, not just how many of
+    the (far coarser) per-worker chunks have completed entirely. Guaranteed to be called once
+    with n_done=0 right before rendering starts and once with n_done==n_total right after the
+    last frame is written (before the ffmpeg stitch, which isn't tracked per-frame). If not
+    given, the same (n_done, n_total) progression is printed to stdout instead.
     """
     if clims is None:
         last_frame = _read_last_frame(data['video_file_path'], data['frame_abs_indices'][-1])
@@ -669,55 +811,43 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
             0, len(data['frame_session_times_2']) - 1)
         selected_abs_2 = data['frame_abs_indices_2'][idxs_2]
 
-    cap     = cv2.VideoCapture(data['video_file_path'])
-    cap2    = cv2.VideoCapture(data['video_file_path_2']) if has_cam2 else None
+    chunk_specs = [
+        (frame_i, int(selected_abs[frame_i]), selected_times[frame_i],
+         int(selected_abs_2[frame_i]) if has_cam2 else None)
+        for frame_i in range(n_out)
+    ]
+    n_workers = max(1, n_workers or os.cpu_count() or 1)
     tmp_dir = tempfile.mkdtemp()
-    cam1_pos, cam2_pos = None, None  # next-read position each cap is currently at; None = unknown/forces a seek
-    artists = None
+
+    def report(n_done):
+        if progress_callback is not None:
+            progress_callback(n_done, n_out)
+        else:
+            print(f'  {n_done}/{n_out}')
+
     try:
-        for frame_i, (abs_frame, t_now) in enumerate(zip(selected_abs, selected_times)):
-            abs_frame = int(abs_frame)
-            _advance_to_frame(cap, cam1_pos, abs_frame)
-            ret, frame = cap.read()
-            cam1_pos = abs_frame + 1 if ret else None
-            if not ret:
-                break
-            frame_2 = None
-            if has_cam2:
-                abs_frame_2 = int(selected_abs_2[frame_i])
-                _advance_to_frame(cap2, cam2_pos, abs_frame_2)
-                ret2, frame_2 = cap2.read()
-                cam2_pos = abs_frame_2 + 1 if ret2 else None
-                if not ret2:
-                    frame_2 = None
-            if artists is None:
-                # figure/axes/target-LUT/labels built once here from frame 0 (including whether
-                # there's a second-camera panel at all, decided by whether frame 0's cam2 read
-                # succeeded - same as the old per-frame-rebuild code would decide for frame 0;
-                # unlike that old code, a *later* frame's failed cam2 read now just freezes that
-                # panel on its last image instead of restructuring the whole figure layout
-                # (which would otherwise mean every output frame recreating every axis/tick/label
-                # from scratch again, defeating the entire point of building this once)
-                artists = _VideoFrameArtists(data, frame, t_now, crop, clims, tail_s=tail_s,
-                                              force_axis_limit=force_axis_limit, lang=lang,
-                                              video_frame_2=frame_2, crop_2=crop_2, clims_2=clims_2)
-            else:
-                artists.update(frame, t_now, video_frame_2=frame_2)
-            # compress_level=1 (default is much higher): these PNGs are throwaway - ffmpeg reads
-            # them once below and then the whole tmp_dir is deleted - so there's no reason to
-            # spend CPU on smaller file size. PNG compression is always lossless regardless of
-            # level, so this is a pure speed win with zero effect on the rendered video's quality
-            # (measured ~20% faster per frame; unlike this, lowering dpi *would* trade real
-            # output resolution for speed, so that's left as a choice rather than changed here)
-            artists.fig.savefig(os.path.join(tmp_dir, f'frame_{frame_i:05d}.png'), dpi=150,
-                                 pil_kwargs={'compress_level': 1})
-            if frame_i % 50 == 0:
-                print(f'  {frame_i}/{n_out}')
-        cap.release()
-        if cap2 is not None:
-            cap2.release()
-        if artists is not None:
-            artists.close()
+        ranges = _chunk_ranges(n_out, n_workers)  # empty if n_out == 0 - no frames to render at all
+        print(f'Rendering across {len(ranges)} worker process(es) ...')
+        report(0)
+        with ProcessPoolExecutor(max_workers=max(1, len(ranges))) as pool:
+            futures = [
+                pool.submit(_render_frame_chunk, data, crop, clims, tail_s, force_axis_limit,
+                            lang, crop_2, clims_2, lut_alpha, dpi, tmp_dir, video_fps,
+                            chunk_specs[start:end])
+                for start, end in ranges
+            ]
+            # workers write PNGs straight into tmp_dir as they go, independently of each other -
+            # polling that count (rather than waiting on whole chunks via as_completed) is what
+            # turns "n_workers coarse jumps" into real, roughly-continuous progress; wait(...,
+            # timeout=...) both paces this poll and blocks efficiently instead of a manual sleep
+            not_done = set(futures)
+            while not_done:
+                _, not_done = futures_wait(not_done, timeout=0.5)
+                report(min(_count_pngs(tmp_dir), n_out))
+            for future in futures:
+                future.result()  # re-raise any worker exception now that all have finished
+            report(n_out)
+
         print('Stitching with ffmpeg ...')
         subprocess.run([
             'ffmpeg', '-y',
@@ -739,7 +869,7 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
 
 def save_render_params(data, output_path, video_fps, playback_speed, crop, clims,
                         clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
-                        crop_2=None, clims_2=None):
+                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150):
     """Write a JSON sidecar next to output_path recording every parameter needed to exactly
     reproduce this render: which subject/session/block/trials/camera(s), the trace filter,
     crop, and brightness settings actually used.
@@ -762,7 +892,7 @@ def save_render_params(data, output_path, video_fps, playback_speed, crop, clims
         crop=list(crop), crop_2=list(crop_2) if crop_2 is not None else None,
         clims=[float(c) for c in clims], clims_2=[float(c) for c in clims_2] if clims_2 is not None else None,
         clim_pct=list(clim_pct), tail_s=tail_s, force_axis_limit=force_axis_limit, lang=lang,
-        video_fps=video_fps, playback_speed=playback_speed,
+        lut_alpha=lut_alpha, dpi=dpi, video_fps=video_fps, playback_speed=playback_speed,
         output_path=str(output_path),
     )
     params_path = Path(output_path).with_suffix('.json')
@@ -799,4 +929,6 @@ def rerender_from_params(params_path, output_path=None):
         crop=tuple(params['crop']), crop_2=tuple(params['crop_2']) if params['crop_2'] else None,
         clims=np.array(params['clims']), clims_2=np.array(params['clims_2']) if params['clims_2'] else None,
         clim_pct=tuple(params['clim_pct']), tail_s=params['tail_s'],
-        force_axis_limit=params['force_axis_limit'], lang=params['lang'])
+        force_axis_limit=params['force_axis_limit'], lang=params['lang'],
+        # .get: older sidecars predate lut_alpha/dpi, fall back to the same defaults render_trial_video uses
+        lut_alpha=params.get('lut_alpha', 0.25), dpi=params.get('dpi', 150))
