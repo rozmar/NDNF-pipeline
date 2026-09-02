@@ -9,6 +9,7 @@ A shared DataJoint pipeline for the Neuronal Diversity in Network Function (NDNF
 - Python >= 3.13
 - MySQL server (for DataJoint database)
 - Graphviz (for schema visualization)
+- ffmpeg (for generating trial videos in the GUIs)
 
 ### Install from GitHub
 
@@ -37,6 +38,20 @@ sudo apt-get install graphviz
 
 # Windows
 # Download from https://graphviz.org/download/
+```
+
+For generating trial videos in the GUIs (`GUIs/behavior_gui.py` / `GUIs/behavior_gui_web.py`), install ffmpeg -
+`ndnf_pipeline.plot.videography_plots.render_trial_video` shells out to whatever `ffmpeg` it finds on `PATH`:
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt-get install ffmpeg
+
+# Windows
+# Download from https://ffmpeg.org/download.html
 ```
 
 ## Configuration

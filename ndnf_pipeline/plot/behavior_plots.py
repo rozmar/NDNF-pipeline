@@ -572,12 +572,18 @@ def plot_session_blocks_overview(subject_id, session,
                                   epochs=None,
                                   filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
                                   filter_polyorder=3, fig_dir=None):
-    """Session-level overview across all of a session's blocks.
+    """Session-level overview across all blocks of one or more sessions.
 
-    Row 1: for every rewarded trial in the session (one panel), the quiescence duration
-           (trial start -> response period start, '^') and response duration (response
-           period start -> threshold crossing, '.'), with each block's trial range
-           highlighted and color-coded. Y axis is log-scaled if perf_log_yscale is True.
+    session: a single session id, or an iterable of session ids to overlay on one figure. Every
+    block of every given session becomes a column (ordered by session, then block).
+
+    Row 1: for every rewarded trial (one panel), the quiescence duration (trial start ->
+           response period start, '^') and response duration (response period start ->
+           threshold crossing, '.'), with each block's trial range highlighted and
+           color-coded. Y axis is log-scaled if perf_log_yscale is True. With multiple
+           sessions, this is a single row with each session's trials placed back-to-back
+           (offset so trial numbers from different sessions never collide) and a vertical
+           divider + date label marking each session boundary.
     Row 2: each block's target LUT, side by side, sharing the same axes and colormap.
     Row 3: each block's force distribution histogram, side by side, sharing the
            same axes and colormap.
@@ -596,60 +602,90 @@ def plot_session_blocks_overview(subject_id, session,
     `filter_polyorder`). `filter_window_ms`/`filter_sigma_ms` are converted to samples using
     each block's own force trace sample interval.
 
-    If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_blocks_overview.png'.
-    Returns the figure.
+    If fig_dir is given, saves to
+    '{fig_dir}/{subject_id}_s{session(s)}_blocks_overview.png'. Returns the figure.
     """
     from ndnf_pipeline import experiment
 
     if uniform_force_range is None:
         uniform_force_range = DEFAULT_UNIFORM_FORCE_RANGE
 
-    available_blocks = np.sort((experiment.Block() & {'subject_id': subject_id, 'session': session}).fetch('block'))
-    n_blocks = len(available_blocks)
-    session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': session}).fetch1('session_date', 'session_time')
-    block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
+    sessions = sorted({session}) if np.isscalar(session) else sorted(set(session))
+    if not sessions:
+        raise RuntimeError("No sessions given.")
+    multi_session = len(sessions) > 1
 
-    # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax ---
+    # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax, and
+    # row 1 can lay every session's trials out on one shared x-axis. session_info accumulates,
+    # per session, the trial-number offset (see GAP below) that row 1 shifts that session's
+    # trials by, plus its own min/max raw trial number and date/time (for the boundary label).
+    GAP = 2  # spacing (in trial-number units) left between consecutive sessions' spans on row 1
     block_data = []
-    for block in available_blocks:
-        key = {'subject_id': subject_id, 'session': session, 'block': block}
-        task_setting_id, target_force_lut = (experiment.TaskSettings() * experiment.Block() & key).fetch1('task_setting_id', 'target_force_lut')
-        force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, session, task_setting_id)
-        lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+    session_info = []
+    trial_offset = 0
+    for sess in sessions:
+        available_blocks = np.sort((experiment.Block() & {'subject_id': subject_id, 'session': sess}).fetch('block'))
+        if len(available_blocks) == 0:
+            # fail with a clear, actionable message here rather than a bare "min() iterable
+            # argument is empty" once block_data (populated below) turns out empty - e.g. a
+            # session that's been created but has no completed blocks logged yet
+            raise RuntimeError(f"No blocks found for {subject_id} session {sess}.")
+        session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': sess}).fetch1('session_date', 'session_time')
 
-        force_traces_0_query = (experiment.TrialForceTrace() * experiment.TrialForceTrace.TrialForceAxis()
-                                 * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0})
-        force_trials, force_trace_times, force_traces_0_ = force_traces_0_query.fetch(
-            'trial', 'force_trace_time', 'force_trace_value', order_by='trial')
-        force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
-                            & {**key, 'force_axis_idx': 1}).fetch('force_trace_value', order_by='trial')
-        f0_baseline = np.median(np.concatenate(force_traces_0_))
-        f1_baseline = np.median(np.concatenate(force_traces_1_))
-        force_traces_0 = [f - f0_baseline for f in force_traces_0_]
-        force_traces_1 = [f - f1_baseline for f in force_traces_1_]
-        lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
-        sample_interval_s = _estimate_sample_interval(force_trace_times)
-        filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
-        filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
-        lr_traces, pa_traces = _filter_traces(lr_traces, pa_traces, filter_method, window=filter_window,
-                                               sigma=filter_sigma, polyorder=filter_polyorder)
-        epoch_windows = _fetch_epoch_windows(experiment, key)
-        lr_traces, pa_traces = _filter_traces_by_epochs(force_trials, force_trace_times, lr_traces, pa_traces,
-                                                         epoch_windows, epochs)
+        session_min_trial = None
+        session_max_trial = None
+        for block in available_blocks:
+            key = {'subject_id': subject_id, 'session': sess, 'block': block}
+            task_setting_id, target_force_lut = (experiment.TaskSettings() * experiment.Block() & key).fetch1('task_setting_id', 'target_force_lut')
+            force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(experiment, subject_id, sess, task_setting_id)
+            lut, lut_extent, lr_extent, pa_extent = _normalize_lut(target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
 
-        histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
-        forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
+            force_traces_0_query = (experiment.TrialForceTrace() * experiment.TrialForceTrace.TrialForceAxis()
+                                     * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0})
+            force_trials, force_trace_times, force_traces_0_ = force_traces_0_query.fetch(
+                'trial', 'force_trace_time', 'force_trace_value', order_by='trial')
+            force_traces_1_ = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
+                                & {**key, 'force_axis_idx': 1}).fetch('force_trace_value', order_by='trial')
+            f0_baseline = np.median(np.concatenate(force_traces_0_))
+            f1_baseline = np.median(np.concatenate(force_traces_1_))
+            force_traces_0 = [f - f0_baseline for f in force_traces_0_]
+            force_traces_1 = [f - f1_baseline for f in force_traces_1_]
+            lr_traces, pa_traces = _lr_pa_traces(force_traces_0, force_traces_1, lr_idx, pa_idx, lr_sign, pa_sign)
+            sample_interval_s = _estimate_sample_interval(force_trace_times)
+            filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
+            filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
+            lr_traces, pa_traces = _filter_traces(lr_traces, pa_traces, filter_method, window=filter_window,
+                                                   sigma=filter_sigma, polyorder=filter_polyorder)
+            epoch_windows = _fetch_epoch_windows(experiment, key)
+            lr_traces, pa_traces = _filter_traces_by_epochs(force_trials, force_trace_times, lr_traces, pa_traces,
+                                                             epoch_windows, epochs)
 
-        block_trials = (experiment.BehaviorTrial() & key).fetch('trial')
-        quiescence_trial, quiescence_value, response_value = _fetch_quiescence_response(experiment, key)
+            histrange = [uniform_force_range[:2], uniform_force_range[2:]] if force_uniform_range else [lr_extent, pa_extent]
+            forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
 
-        block_data.append(dict(block=block, lut=lut, lut_extent=lut_extent,
-                                forcehist=forcehist, binx=binx, biny=biny,
-                                lr_traces=lr_traces, pa_traces=pa_traces,
-                                block_trials=block_trials,
-                                quiescence_trial=quiescence_trial,
-                                quiescence_value=quiescence_value,
-                                response_value=response_value))
+            block_trials = (experiment.BehaviorTrial() & key).fetch('trial')
+            quiescence_trial, quiescence_value, response_value = _fetch_quiescence_response(experiment, key)
+
+            block_data.append(dict(session=sess, block=block, lut=lut, lut_extent=lut_extent,
+                                    forcehist=forcehist, binx=binx, biny=biny,
+                                    lr_traces=lr_traces, pa_traces=pa_traces,
+                                    block_trials=block_trials,
+                                    quiescence_trial=quiescence_trial,
+                                    quiescence_value=quiescence_value,
+                                    response_value=response_value))
+            if len(block_trials):
+                lo, hi = int(block_trials.min()), int(block_trials.max())
+                session_min_trial = lo if session_min_trial is None else min(session_min_trial, lo)
+                session_max_trial = hi if session_max_trial is None else max(session_max_trial, hi)
+
+        session_info.append(dict(session=sess, session_date=session_date, session_time=session_time,
+                                  offset=trial_offset, min_trial=session_min_trial, max_trial=session_max_trial))
+        if session_min_trial is not None:
+            trial_offset += (session_max_trial - session_min_trial + 1) + GAP
+
+    n_blocks = len(block_data)
+    block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
+    offset_by_session = {si['session']: si['offset'] for si in session_info}
 
     lut_vmin = min(np.min(bd['lut']) for bd in block_data)
     lut_vmax = max(np.max(bd['lut']) for bd in block_data)
@@ -660,15 +696,37 @@ def plot_session_blocks_overview(subject_id, session,
     fig = plt.figure(figsize=(4 * max(n_blocks, 1), 13))
     gs = plt.GridSpec(4, max(n_blocks, 1), figure=fig, height_ratios=[1, 1.1, 1.1, 1.1], hspace=0.5, wspace=0.3)
 
-    # --- row 1: quiescence & response durations across the whole session, blocks highlighted ---
+    # --- row 1: quiescence & response durations, blocks highlighted. With multiple sessions,
+    # each session's trials are shifted right by its offset (see session_info above) so they sit
+    # back-to-back on one shared x-axis instead of overlapping. ---
     ax_perf = fig.add_subplot(gs[0, :])
     for bd, color in zip(block_data, block_colors):
+        offset = offset_by_session[bd['session']]
         if len(bd['block_trials']):
-            ax_perf.axvspan(bd['block_trials'].min() - 0.5, bd['block_trials'].max() + 0.5, color=color, alpha=0.15)
-        _plot_quiescence_response(ax_perf, bd['quiescence_trial'], bd['quiescence_value'], bd['response_value'],
+            ax_perf.axvspan(bd['block_trials'].min() + offset - 0.5, bd['block_trials'].max() + offset + 0.5,
+                             color=color, alpha=0.15)
+        _plot_quiescence_response(ax_perf, bd['quiescence_trial'] + offset, bd['quiescence_value'], bd['response_value'],
                                    color=color, smoothing_window=perf_smoothing_window,
                                    log_yscale=perf_log_yscale)
-    ax_perf.set_title(f'{subject_id} s{session}  {session_date} {session_time}')
+    if multi_session:
+        for si in session_info:
+            if si['min_trial'] is None:
+                continue
+            left = si['offset'] - 0.5
+            if si is not session_info[0]:
+                ax_perf.axvline(left, color='gray', linestyle='--', linewidth=1, alpha=0.7)
+            mid = si['offset'] + (si['max_trial'] - si['min_trial']) / 2
+            # placed just below the (tick-less, in the multi-session case) x-axis rather than
+            # above the plot, so it never collides with the title or with data near the top
+            ax_perf.text(mid, -0.04, f"s{si['session']}  {si['session_date']}", transform=ax_perf.get_xaxis_transform(),
+                         ha='center', va='top', fontsize=8)
+        ax_perf.set_title(f"{subject_id}  ({', '.join(f's{si['session']}' for si in session_info)})")
+    else:
+        si = session_info[0]
+        ax_perf.set_title(f"{subject_id} s{si['session']}  {si['session_date']} {si['session_time']}")
+    ax_perf.set_xlabel('trial#' if not multi_session else '')
+    if multi_session:
+        ax_perf.set_xticks([])
     # shrink row 1's own axes and put the marker legend in the freed-up strip to its right,
     # so it never sits on top of the data (or of row 2 below it)
     pos = ax_perf.get_position()
@@ -693,7 +751,7 @@ def plot_session_blocks_overview(subject_id, session,
         if force_uniform_range:
             ax_lut.set_xlim(uniform_force_range[:2])
             ax_lut.set_ylim(uniform_force_range[2:])
-        ax_lut.set_title(f"block {bd['block']}", color=color)
+        ax_lut.set_title(f"s{bd['session']} b{bd['block']}" if multi_session else f"block {bd['block']}", color=color)
         axes_lut.append(ax_lut)
     if im_lut is not None:
         fig.colorbar(im_lut, ax=axes_lut, label='reward port speed')
@@ -737,7 +795,8 @@ def plot_session_blocks_overview(subject_id, session,
 
     if fig_dir is not None:
         os.makedirs(fig_dir, exist_ok=True)
-        fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_blocks_overview.png'), dpi=150)
+        session_tag = '-'.join(str(s) for s in sessions)
+        fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session_tag}_blocks_overview.png'), dpi=150)
 
     return fig
 

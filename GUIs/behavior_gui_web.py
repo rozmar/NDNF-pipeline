@@ -23,7 +23,11 @@ it up), and open the forwarded URL in your local browser.
 
 --allow-websocket-origin=* matters here: the whole UI is painted over a
 websocket back to this process, and Bokeh (which Panel is built on) rejects
-websocket connections whose Origin header doesn't match a known host. The
+websocket connections
+
+
+
+ whose Origin header doesn't match a known host. The
 forwarded URL VS Code hands you is almost never literally "localhost:5006"
 (it's a proxied domain/port), so without this flag the page loads as a blank
 shell - HTML/CSS arrive, but no widgets ever get painted into it.
@@ -296,15 +300,16 @@ class SessionOverviewTab:
         self.refresh()
 
     def refresh(self, *_):
-        subject_id, session = self.app.get_selected_subject_session()
-        if subject_id is None or session is None:
+        subject_id = self.app.subject_select.value or None
+        sessions = self.app.get_selected_sessions()
+        if subject_id is None or not sessions:
             self.pane.object = None
             return
         from ndnf_pipeline.plot.behavior_plots import plot_session_blocks_overview
 
         def work():
             return plot_session_blocks_overview(
-                subject_id, session,
+                subject_id, sessions,
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
@@ -329,7 +334,8 @@ class BlockDetailTab:
         self.app = app
         self._block_guard = _Guard()
         self._trial_guard = _Guard()
-        self.block_select = pn.widgets.Select(name="Block", options=[], width=100)
+        self._blocks_by_label = {}  # block_select label -> (session, block)
+        self.block_select = pn.widgets.Select(name="Block", options=[], width=130)
         self.range_control = UniformRangeControl(on_change=self.refresh)
         self.perf_controls = PerfAxisControls(on_change=self.refresh)
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
@@ -352,8 +358,10 @@ class BlockDetailTab:
         self.panel = pn.Column(controls, body)
 
     def on_session_changed(self):
-        subject_id, session = self.app.get_selected_subject_session()
-        if subject_id is None or session is None:
+        subject_id = self.app.subject_select.value or None
+        sessions = self.app.get_selected_sessions()
+        self._blocks_by_label = {}
+        if subject_id is None or not sessions:
             with self._block_guard:
                 self.block_select.options = []
             with self._trial_guard:
@@ -361,18 +369,23 @@ class BlockDetailTab:
             self.pane.object = None
             self.app.update_shared_sample_interval()
             return
+        multi_session = len(sessions) > 1
         try:
-            blocks = sorted((self.app.experiment.Block()
-                              & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+            pairs = []
+            for session in sessions:
+                blocks = sorted((self.app.experiment.Block()
+                                  & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+                pairs.extend((session, block) for block in blocks)
         except Exception as exc:
             self.app.report_error(exc)
             return
-        values = [str(b) for b in blocks]
+        labels = [f"s{session} b{block}" if multi_session else str(block) for session, block in pairs]
+        self._blocks_by_label = dict(zip(labels, pairs))
         with self._block_guard:
-            self.block_select.options = values
-            if values:
-                self.block_select.value = values[0]
-        if values:
+            self.block_select.options = labels
+            if labels:
+                self.block_select.value = labels[0]
+        if labels:
             self.on_block_selected()
         else:
             with self._trial_guard:
@@ -385,14 +398,18 @@ class BlockDetailTab:
         self.app.update_shared_sample_interval()
         self.refresh()
 
+    def get_selected_session_block(self):
+        """(session, block) for whatever's currently picked in block_select, or (None, None)."""
+        return self._blocks_by_label.get(self.block_select.value, (None, None))
+
     def reload_trials(self):
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.block_select.value
-        if subject_id is None or session is None or not block_str:
+        subject_id = self.app.subject_select.value or None
+        session, block = self.get_selected_session_block()
+        if subject_id is None or session is None:
             with self._trial_guard:
                 self.trial_select.options = []
             return
-        key = {"subject_id": subject_id, "session": session, "block": int(block_str)}
+        key = {"subject_id": subject_id, "session": session, "block": block}
         try:
             trials = sorted((self.app.experiment.BehaviorTrial() & key).fetch("trial").tolist())
         except Exception as exc:
@@ -416,11 +433,10 @@ class BlockDetailTab:
         return [int(t) for t in self.trial_select.value]
 
     def refresh(self, *_):
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.block_select.value
-        if subject_id is None or session is None or not block_str:
+        subject_id = self.app.subject_select.value or None
+        session, block = self.get_selected_session_block()
+        if subject_id is None or session is None:
             return
-        block = int(block_str)
         selected_trials = self.get_selected_trials()
         from ndnf_pipeline.plot.behavior_plots import plot_block_force_figure
 
@@ -604,6 +620,8 @@ class VideoGenerationTab:
         self._preview_clims_2 = None
         self._output_dir = None
         self._render_queue = queue.Queue()
+        self._render_progress_state = (0, 0)  # (n_done, n_total), written by the render thread
+        self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
         self._inherited_trial_end = None
@@ -619,6 +637,9 @@ class VideoGenerationTab:
         self.use_camera_2 = pn.widgets.Checkbox(name="Add a 2nd camera (stacked below camera 1)", value=False)
         self.camera_2_select = pn.widgets.Select(name="Camera 2", options=[], width=180, disabled=True)
         self.use_camera_2.param.watch(lambda e: self._on_camera2_toggle(), "value")
+        self.camera_select.param.watch(self._update_default_filename, "value")
+        self.camera_2_select.param.watch(self._update_default_filename, "value")
+        self.use_camera_2.param.watch(self._update_default_filename, "value")
         cameras_row = pn.Row(self.camera_select, self.use_camera_2, self.camera_2_select)
 
         self.pad_start = pn.widgets.FloatInput(name="pad start (s)", value=1.0, width=90)
@@ -671,8 +692,9 @@ class VideoGenerationTab:
 
         self.output_dir_input = pn.widgets.TextInput(name="Output folder", width=340)
         cfg = dj_connection.load_gui_config()
-        self.output_dir_input.value = cfg.get("video_output_dir") or str(Path.home())
+        self.output_dir_input.value = cfg.get("video_output_dir") or "/home/coder/project/Videos"
         self.output_name_input = pn.widgets.TextInput(name="Output filename", value="video.mp4", width=260)
+        self._last_auto_name = self.output_name_input.value
 
         self.render_btn = pn.widgets.Button(name="Render video", button_type="primary", width=120)
         self.render_btn.on_click(lambda e: self.start_render())
@@ -690,11 +712,17 @@ class VideoGenerationTab:
 
     # --- inherit block/trials from the Block Detail tab ---
     def on_session_changed(self):
-        self.reload_cameras()
+        # sync first so _inherited_session reflects the actual session of whatever block is
+        # selected in Block Detail (which may not be the app's "primary" selected session, once
+        # more than one session is selected) - reload_cameras then uses that.
         self.sync_from_block_detail()
+        self.reload_cameras()
 
     def reload_cameras(self):
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_select.value or None
+        session = self._inherited_session
+        if session is None:
+            _, session = self.app.get_selected_subject_session()
         if subject_id is None or session is None:
             self.camera_select.options = []
             self.camera_2_select.options = []
@@ -722,46 +750,78 @@ class VideoGenerationTab:
     def sync_from_block_detail(self):
         """Re-read the Block Detail tab's block + trial selection (none selected there = every
         trial in the block) and convert it into the block-relative trial_start/trial_end indices
-        load_trial_video_data expects."""
+        load_trial_video_data expects. The session comes from whichever (session, block) Block
+        Detail currently has picked - not necessarily the app's "primary" selected session, once
+        more than one session is selected there."""
+        self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
         self._inherited_trial_end = None
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.app.block_detail_tab.block_select.value
-        if subject_id is None or session is None or not block_str:
+        subject_id = self.app.subject_select.value or None
+        session, block = self.app.block_detail_tab.get_selected_session_block()
+        if subject_id is None or session is None:
             self.inherited_label.object = "*(switch to the Block Detail tab and pick a block first)*"
+            self._update_default_filename()
             return
+        block_label = self.app.block_detail_tab.block_select.value
         try:
             all_trials = sorted((self.app.experiment.BehaviorTrial()
-                                  & {"subject_id": subject_id, "session": session, "block": int(block_str)}
+                                  & {"subject_id": subject_id, "session": session, "block": block}
                                   ).fetch("trial").tolist())
         except Exception as exc:
             self.app.report_error(exc)
             return
         if not all_trials:
-            self.inherited_label.object = f"Block {block_str}: no trials in this block"
+            self.inherited_label.object = f"Block {block_label}: no trials in this block"
+            self._update_default_filename()
             return
         selected = self.app.block_detail_tab.get_selected_trials()
         chosen = sorted(t for t in selected if t in all_trials) if selected else all_trials
         if not chosen:
-            self.inherited_label.object = f"Block {block_str}: the selected trials aren't in this block"
+            self.inherited_label.object = f"Block {block_label}: the selected trials aren't in this block"
+            self._update_default_filename()
             return
-        self._inherited_block = int(block_str)
+        self._inherited_session = session
+        self._inherited_block = block
         self._inherited_trial_start = all_trials.index(min(chosen))
         self._inherited_trial_end = all_trials.index(max(chosen))
         if selected:
-            self.inherited_label.object = (f"Block {block_str}: trials {min(chosen)}-{max(chosen)} "
+            self.inherited_label.object = (f"Block {block_label}: trials {min(chosen)}-{max(chosen)} "
                                             f"({len(chosen)} of {len(all_trials)} selected)")
         else:
-            self.inherited_label.object = (f"Block {block_str}: all {len(all_trials)} trials "
+            self.inherited_label.object = (f"Block {block_label}: all {len(all_trials)} trials "
                                             f"(trial numbers {all_trials[0]}-{all_trials[-1]})")
+        self._update_default_filename()
+
+    def _compute_default_filename(self):
+        """Mirrors Tkinter's choose_output_path() default-name logic."""
+        subject_id = self.app.subject_select.value or None
+        session = self._inherited_session
+        camera = self.camera_select.value
+        camera_suffix = camera
+        if self.use_camera_2.value and self.camera_2_select.value:
+            camera_suffix = f"{camera}+{self.camera_2_select.value}"
+        if subject_id and session is not None and self._inherited_block is not None and camera:
+            return (f"{subject_id}_s{session}_b{self._inherited_block}_"
+                    f"t{self._inherited_trial_start}-{self._inherited_trial_end}_{camera_suffix}.mp4")
+        return "video.mp4"
+
+    def _update_default_filename(self, *_):
+        """Keep the filename field auto-populated as block/trial/camera selection changes,
+        without clobbering a name the user has deliberately typed in themselves - only
+        overwrite it if it still matches the last value *we* auto-generated."""
+        new_name = self._compute_default_filename()
+        if self.output_name_input.value == self._last_auto_name:
+            self.output_name_input.value = new_name
+        self._last_auto_name = new_name
 
     # --- widget value parsing ---
     def _current_params(self):
         """Read + validate the inherited block/trial-range plus the camera selection(s). Returns
         load_trial_video_data kwargs, or None (after reporting the problem) if something
         required is missing/invalid."""
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_select.value or None
+        session = self._inherited_session
         camera = self.camera_select.value
         camera_2 = self.camera_2_select.value if self.use_camera_2.value else None
         if subject_id is None or session is None:
@@ -781,7 +841,11 @@ class VideoGenerationTab:
         return dict(subject_id=subject_id, session=session, block=self._inherited_block,
                     trial_start=self._inherited_trial_start, trial_end=self._inherited_trial_end,
                     camera_name=camera, camera_name_2=camera_2,
-                    pad_start=self.pad_start.value or 1.0, pad_end=self.pad_end.value or 1.0)
+                    pad_start=self.pad_start.value or 1.0, pad_end=self.pad_end.value or 1.0,
+                    # same shared trace-filter control used by Session Overview / Block Detail,
+                    # so the video's trace is smoothed the same way as whatever you were just
+                    # looking at there - see load_trial_video_data's filter_method docs
+                    **self.app.filter_controls.get_filter_kwargs())
 
     def _render_kwargs(self):
         return dict(
@@ -918,15 +982,28 @@ class VideoGenerationTab:
         self.render_btn.disabled = True
         self.render_progress.visible = True
         self.render_progress.active = True
+        self.render_progress.value = -1  # indeterminate until the first real (n_done, n_total) report arrives
+        self._render_progress_state = (0, 0)
         self.app.status.object = "Rendering video... this can take a while."
 
         def work():
             try:
-                from ndnf_pipeline.plot.videography_plots import load_trial_video_data, render_trial_video
+                from ndnf_pipeline.plot.videography_plots import (
+                    load_trial_video_data, render_trial_video, save_render_params)
                 data = load_trial_video_data(**params)
-                render_trial_video(data, output_path, video_fps=fps, playback_speed=speed,
-                                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
-                self._render_queue.put(("done", output_path))
+                # called from the render worker/polling thread, not Panel's event-loop thread -
+                # so it only stashes the numbers; _poll_render_queue (running on the event loop
+                # via add_periodic_callback) is what actually touches the render_progress widget
+                _, used_clims, used_clims_2 = render_trial_video(
+                    data, output_path, video_fps=fps, playback_speed=speed,
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2,
+                    progress_callback=lambda n_done, n_total: setattr(
+                        self, '_render_progress_state', (n_done, n_total)),
+                    **render_kwargs)
+                params_path = save_render_params(
+                    data, output_path, video_fps=fps, playback_speed=speed,
+                    crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
+                self._render_queue.put(("done", (output_path, params_path)))
             except Exception as exc:
                 self._render_queue.put(("error", exc))
 
@@ -934,6 +1011,11 @@ class VideoGenerationTab:
         self._poll_handle = pn.state.add_periodic_callback(self._poll_render_queue, period=300)
 
     def _poll_render_queue(self):
+        n_done, n_total = self._render_progress_state
+        if n_total > 0:
+            self.render_progress.active = False
+            self.render_progress.max = n_total
+            self.render_progress.value = n_done
         try:
             status, payload = self._render_queue.get_nowait()
         except queue.Empty:
@@ -941,10 +1023,13 @@ class VideoGenerationTab:
         self._poll_handle.stop()
         self.render_progress.active = False
         self.render_progress.visible = False
+        self.render_progress.value = -1  # back to indeterminate default, ready for the next render
         self.render_btn.disabled = False
         if status == "done":
-            self.app.status.object = f"Video saved: {payload}"
-            pn.state.notifications.success(f"Video saved:\n{payload}", duration=0)
+            output_path, params_path = payload
+            self.app.status.object = f"Video saved: {output_path}  (params: {params_path})"
+            pn.state.notifications.success(f"Video saved:\n{output_path}\n\nParams saved:\n{params_path}",
+                                            duration=0)
         else:
             self.app.status.object = "Render failed - see error notification."
             self.app.report_error(payload)
@@ -966,7 +1051,8 @@ class BehaviorGUI:
         self._subject_guard = _Guard()
         self._session_guard = _Guard()
         self.subject_select = pn.widgets.Select(name="Subject", options=[], width=160)
-        self.session_select = pn.widgets.Select(name="Session", options=[], width=280)
+        self.session_select = pn.widgets.MultiSelect(name="Session(s) (ctrl/shift-click to compare several)",
+                                                       options=[], size=8, width=280)
         self.subject_select.param.watch(self._subject_guard.wrap(lambda e: self.on_subject_selected()), "value")
         self.session_select.param.watch(self._session_guard.wrap(lambda e: self.on_session_selected()), "value")
 
@@ -1038,9 +1124,9 @@ class BehaviorGUI:
         if subject_id is None or session is None:
             self.filter_controls.set_sample_interval(None)
             return
-        block_str = self.block_detail_tab.block_select.value
-        if block_str:
-            block = int(block_str)
+        block_session, block = self.block_detail_tab.get_selected_session_block()
+        if block is not None:
+            session = block_session
         else:
             try:
                 blocks = sorted((self.experiment.Block()
@@ -1143,8 +1229,9 @@ class BehaviorGUI:
         self._sessions_by_label = dict(zip(labels, sessions.tolist()))
         with self._session_guard:
             self.session_select.options = labels
-            if labels:
-                self.session_select.value = labels[0]
+            # default to the most recent session only - multi-session comparison is opt-in
+            # (ctrl/shift-click more sessions in the widget)
+            self.session_select.value = [labels[0]] if labels else []
         self.on_session_selected()
 
     def on_session_selected(self):
@@ -1156,10 +1243,17 @@ class BehaviorGUI:
             if hook is not None:
                 hook()
 
+    def get_selected_sessions(self):
+        """Every currently selected session, sorted ascending (chronological by session id)."""
+        return sorted(self._sessions_by_label[label] for label in self.session_select.value)
+
     def get_selected_subject_session(self):
+        """Subject + the "primary" (first) selected session, for tabs that only need one -
+        Subject Trend / Trials per Mouse / Water Restriction use just the subject, and the
+        shared sample-interval hint falls back to this when Block Detail has no block picked."""
         subject_id = self.subject_select.value or None
-        session = self._sessions_by_label.get(self.session_select.value)
-        return subject_id, session
+        sessions = self.get_selected_sessions()
+        return subject_id, (sessions[0] if sessions else None)
 
     # --- plotting / error helpers ---
     def run_plot(self, work_fn, pane):
