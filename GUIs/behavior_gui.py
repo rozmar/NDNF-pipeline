@@ -287,14 +287,18 @@ class SessionOverviewTab(ttk.Frame):
         self.range_control.pack(side="left")
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
         self.perf_controls.pack(side="left", padx=(10, 0))
-        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+        ttk.Button(controls, text="Refresh", command=lambda: self.refresh(force=True)).pack(side="left", padx=(10, 0))
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Auto refresh", variable=self.auto_refresh_var).pack(side="left", padx=(6, 0))
         self.panel = PlotPanel(self)
         self.panel.pack(fill="both", expand=True)
 
     def on_session_changed(self):
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, force=False):
+        if not force and not self.auto_refresh_var.get():
+            return
         subject_id = self.app.subject_var.get() or None
         sessions = self.app.get_selected_sessions()
         if subject_id is None or not sessions:
@@ -338,7 +342,9 @@ class BlockDetailTab(ttk.Frame):
         self.range_control.pack(side="left", padx=(10, 0))
         self.perf_controls = PerfAxisControls(controls, on_change=self.refresh)
         self.perf_controls.pack(side="left", padx=(10, 0))
-        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left", padx=(10, 0))
+        ttk.Button(controls, text="Refresh", command=lambda: self.refresh(force=True)).pack(side="left", padx=(10, 0))
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Auto refresh", variable=self.auto_refresh_var).pack(side="left", padx=(6, 0))
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
@@ -430,7 +436,9 @@ class BlockDetailTab(ttk.Frame):
     def get_selected_trials(self):
         return [int(self.trial_listbox.get(i)) for i in self.trial_listbox.curselection()]
 
-    def refresh(self):
+    def refresh(self, force=False):
+        if not force and not self.auto_refresh_var.get():
+            return
         subject_id = self.app.subject_var.get() or None
         session, block = self.get_selected_session_block()
         if subject_id is None or session is None:
@@ -460,14 +468,18 @@ class SubjectTrendTab(ttk.Frame):
         self.app = app
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=5, pady=5)
-        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(controls, text="Refresh", command=lambda: self.refresh(force=True)).pack(side="left")
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Auto refresh", variable=self.auto_refresh_var).pack(side="left", padx=(6, 0))
         self.panel = PlotPanel(self)
         self.panel.pack(fill="both", expand=True)
 
     def on_subject_changed(self):
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, force=False):
+        if not force and not self.auto_refresh_var.get():
+            return
         subject_id, _ = self.app.get_selected_subject_session()
         if subject_id is None:
             self.panel.clear()
@@ -506,6 +518,11 @@ class TrialsPerMouseTab(ttk.Frame):
         ttk.Button(button_row, text="All", command=self.select_all).pack(side="left")
         ttk.Button(button_row, text="None", command=self.select_none).pack(side="left", padx=(4, 0))
         ttk.Button(left, text="Reload mouse list", command=self.reload_mice).pack(fill="x", pady=(5, 0))
+        refresh_row = ttk.Frame(left)
+        refresh_row.pack(fill="x", pady=(5, 0))
+        ttk.Button(refresh_row, text="Refresh", command=lambda: self.refresh(force=True)).pack(side="left")
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(refresh_row, text="Auto refresh", variable=self.auto_refresh_var).pack(side="left", padx=(6, 0))
 
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True)
@@ -553,7 +570,9 @@ class TrialsPerMouseTab(ttk.Frame):
     def get_selected_mice(self):
         return [self.mouse_listbox.get(i) for i in self.mouse_listbox.curselection()]
 
-    def refresh(self):
+    def refresh(self, force=False):
+        if not force and not self.auto_refresh_var.get():
+            return
         if self.app.lab is None or self.app.experiment is None:
             return
         selected = self.get_selected_mice()
@@ -577,14 +596,18 @@ class WaterRestrictionTab(ttk.Frame):
         self.app = app
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=5, pady=5)
-        ttk.Button(controls, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(controls, text="Refresh", command=lambda: self.refresh(force=True)).pack(side="left")
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Auto refresh", variable=self.auto_refresh_var).pack(side="left", padx=(6, 0))
         self.panel = PlotPanel(self)
         self.panel.pack(fill="both", expand=True)
 
     def on_subject_changed(self):
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, force=False):
+        if not force and not self.auto_refresh_var.get():
+            return
         subject_id, _ = self.app.get_selected_subject_session()
         from ndnf_pipeline.plot.behavior_plots import plot_water_restriction_overview
 
@@ -617,6 +640,7 @@ class VideoGenerationTab(ttk.Frame):
         self._preview_clims_2 = None
         self._output_path = None
         self._render_queue = queue.Queue()
+        self._render_progress_state = (0, 0)  # (n_done, n_total), written by the render thread
         self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
@@ -1013,7 +1037,9 @@ class VideoGenerationTab(ttk.Frame):
         output_path = self._output_path
 
         self.render_button.config(state="disabled")
+        self.render_progress.config(mode="indeterminate")
         self.render_progress.start(50)
+        self._render_progress_state = (0, 0)
         self.app.status_var.set("Rendering video... this can take a while.")
 
         def work():
@@ -1021,9 +1047,15 @@ class VideoGenerationTab(ttk.Frame):
                 from ndnf_pipeline.plot.videography_plots import (
                     load_trial_video_data, render_trial_video, save_render_params)
                 data = load_trial_video_data(**params)
+                # called from the render worker thread, not the Tk main loop - so it only
+                # stashes the numbers; _poll_render_queue (running via after()) is what
+                # actually touches the render_progress widget
                 _, used_clims, used_clims_2 = render_trial_video(
                     data, output_path, video_fps=fps, playback_speed=speed,
-                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2, **render_kwargs)
+                    crop=crop, crop_2=crop_2, clims=clims, clims_2=clims_2,
+                    progress_callback=lambda n_done, n_total: setattr(
+                        self, '_render_progress_state', (n_done, n_total)),
+                    **render_kwargs)
                 params_path = save_render_params(
                     data, output_path, video_fps=fps, playback_speed=speed,
                     crop=crop, crop_2=crop_2, clims=used_clims, clims_2=used_clims_2, **render_kwargs)
@@ -1035,12 +1067,19 @@ class VideoGenerationTab(ttk.Frame):
         self.after(200, self._poll_render_queue)
 
     def _poll_render_queue(self):
+        n_done, n_total = self._render_progress_state
+        if n_total > 0:
+            if str(self.render_progress["mode"]) != "determinate":
+                self.render_progress.stop()
+                self.render_progress.config(mode="determinate", maximum=n_total)
+            self.render_progress["value"] = n_done
         try:
             status, payload = self._render_queue.get_nowait()
         except queue.Empty:
             self.after(200, self._poll_render_queue)
             return
         self.render_progress.stop()
+        self.render_progress.config(mode="indeterminate", value=0)
         self.render_button.config(state="normal")
         if status == "done":
             output_path, params_path = payload

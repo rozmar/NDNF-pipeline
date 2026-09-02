@@ -290,16 +290,19 @@ class SessionOverviewTab:
         self.range_control = UniformRangeControl(on_change=self.refresh)
         self.perf_controls = PerfAxisControls(on_change=self.refresh)
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
-        refresh_btn.on_click(lambda e: self.refresh())
+        refresh_btn.on_click(lambda e: self.refresh(force=True))
+        self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
 
         self.pane = make_plot_pane()
-        controls = pn.Row(self.range_control, self.perf_controls, refresh_btn)
+        controls = pn.Row(self.range_control, self.perf_controls, refresh_btn, self.auto_refresh_cb)
         self.panel = pn.Column(controls, self.pane)
 
     def on_session_changed(self):
         self.refresh()
 
-    def refresh(self, *_):
+    def refresh(self, *_, force=False):
+        if not force and not self.auto_refresh_cb.value:
+            return
         subject_id = self.app.subject_select.value or None
         sessions = self.app.get_selected_sessions()
         if subject_id is None or not sessions:
@@ -339,9 +342,10 @@ class BlockDetailTab:
         self.range_control = UniformRangeControl(on_change=self.refresh)
         self.perf_controls = PerfAxisControls(on_change=self.refresh)
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
+        self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
 
         self.block_select.param.watch(self._block_guard.wrap(lambda e: self.on_block_selected()), "value")
-        refresh_btn.on_click(lambda e: self.refresh())
+        refresh_btn.on_click(lambda e: self.refresh(force=True))
 
         self.trial_select = pn.widgets.MultiSelect(
             name="Trials for 2D hist & trajectories (none = all)", options=[], size=20, width=150)
@@ -352,7 +356,7 @@ class BlockDetailTab:
         none_btn.on_click(lambda e: self.select_no_trials())
 
         self.pane = make_plot_pane()
-        controls = pn.Row(self.block_select, self.range_control, self.perf_controls, refresh_btn)
+        controls = pn.Row(self.block_select, self.range_control, self.perf_controls, refresh_btn, self.auto_refresh_cb)
         left = pn.Column(self.trial_select, pn.Row(all_btn, none_btn), width=170)
         body = pn.Row(left, self.pane)
         self.panel = pn.Column(controls, body)
@@ -432,7 +436,9 @@ class BlockDetailTab:
     def get_selected_trials(self):
         return [int(t) for t in self.trial_select.value]
 
-    def refresh(self, *_):
+    def refresh(self, *_, force=False):
+        if not force and not self.auto_refresh_cb.value:
+            return
         subject_id = self.app.subject_select.value or None
         session, block = self.get_selected_session_block()
         if subject_id is None or session is None:
@@ -462,14 +468,17 @@ class SubjectTrendTab:
     def __init__(self, app):
         self.app = app
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
-        refresh_btn.on_click(lambda e: self.refresh())
+        refresh_btn.on_click(lambda e: self.refresh(force=True))
+        self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
         self.pane = make_plot_pane()
-        self.panel = pn.Column(pn.Row(refresh_btn), self.pane)
+        self.panel = pn.Column(pn.Row(refresh_btn, self.auto_refresh_cb), self.pane)
 
     def on_subject_changed(self):
         self.refresh()
 
-    def refresh(self, *_):
+    def refresh(self, *_, force=False):
+        if not force and not self.auto_refresh_cb.value:
+            return
         subject_id, _session = self.app.get_selected_subject_session()
         if subject_id is None:
             self.pane.object = None
@@ -497,14 +506,18 @@ class TrialsPerMouseTab:
         all_btn = pn.widgets.Button(name="All", width=70)
         none_btn = pn.widgets.Button(name="None", width=70)
         reload_btn = pn.widgets.Button(name="Reload mouse list", width=160)
+        refresh_btn = pn.widgets.Button(name="Refresh", width=90)
         all_btn.on_click(lambda e: self.select_all())
         none_btn.on_click(lambda e: self.select_none())
         reload_btn.on_click(lambda e: self.reload_mice())
+        refresh_btn.on_click(lambda e: self.refresh(force=True))
+        self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
 
         self.bar_pane = make_plot_pane()
         self.trend_pane = make_plot_pane()
 
-        left = pn.Column(self.mouse_select, pn.Row(all_btn, none_btn), reload_btn, width=200)
+        left = pn.Column(self.mouse_select, pn.Row(all_btn, none_btn), reload_btn,
+                          pn.Row(refresh_btn, self.auto_refresh_cb), width=200)
         right = pn.Column(
             pn.pane.Markdown("**Total trials** (selected mice, or all mice if none selected)"),
             self.bar_pane,
@@ -548,7 +561,9 @@ class TrialsPerMouseTab:
     def get_selected_mice(self):
         return list(self.mouse_select.value)
 
-    def refresh(self, *_):
+    def refresh(self, *_, force=False):
+        if not force and not self.auto_refresh_cb.value:
+            return
         if self.app.lab is None or self.app.experiment is None:
             return
         selected = self.get_selected_mice()
@@ -572,14 +587,17 @@ class WaterRestrictionTab:
     def __init__(self, app):
         self.app = app
         refresh_btn = pn.widgets.Button(name="Refresh", button_type="primary", width=90)
-        refresh_btn.on_click(lambda e: self.refresh())
+        refresh_btn.on_click(lambda e: self.refresh(force=True))
+        self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
         self.pane = make_plot_pane()
-        self.panel = pn.Column(pn.Row(refresh_btn), self.pane)
+        self.panel = pn.Column(pn.Row(refresh_btn, self.auto_refresh_cb), self.pane)
 
     def on_subject_changed(self):
         self.refresh()
 
-    def refresh(self, *_):
+    def refresh(self, *_, force=False):
+        if not force and not self.auto_refresh_cb.value:
+            return
         subject_id, _session = self.app.get_selected_subject_session()
         from ndnf_pipeline.plot.behavior_plots import plot_water_restriction_overview
 
