@@ -751,7 +751,7 @@ def _render_frame_chunk(data, crop, clims, tail_s, force_axis_limit, lang, crop_
 
 def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop=(0, 0, 0, 0),
                         clims=None, clim_pct=(0, 95), tail_s=5, force_axis_limit=10.0, lang='en',
-                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, n_workers=4,
+                        crop_2=None, clims_2=None, lut_alpha=0.25, dpi=150, n_workers=None,
                         progress_callback=None):
     """Render and stitch the full trial-range video with ffmpeg.
 
@@ -816,7 +816,7 @@ def render_trial_video(data, output_path, video_fps=20, playback_speed=1.0, crop
          int(selected_abs_2[frame_i]) if has_cam2 else None)
         for frame_i in range(n_out)
     ]
-    n_workers = max(1, n_workers or os.cpu_count() or 1)
+    n_workers = max(1, n_workers or int(os.cpu_count()/2) or 1)
     tmp_dir = tempfile.mkdtemp()
 
     def report(n_done):
