@@ -295,15 +295,16 @@ class SessionOverviewTab(ttk.Frame):
         self.refresh()
 
     def refresh(self):
-        subject_id, session = self.app.get_selected_subject_session()
-        if subject_id is None or session is None:
+        subject_id = self.app.subject_var.get() or None
+        sessions = self.app.get_selected_sessions()
+        if subject_id is None or not sessions:
             self.panel.clear()
             return
         from ndnf_pipeline.plot.behavior_plots import plot_session_blocks_overview
 
         def work():
             return plot_session_blocks_overview(
-                subject_id, session,
+                subject_id, sessions,
                 force_uniform_range=self.range_control.enabled,
                 uniform_force_range=self.range_control.get_range(),
                 perf_log_yscale=self.perf_controls.log_scale,
@@ -325,11 +326,12 @@ class BlockDetailTab(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
+        self._blocks_by_label = {}  # block_var label -> (session, block)
         controls = ttk.Frame(self)
         controls.pack(fill="x", padx=5, pady=5)
         ttk.Label(controls, text="Block:").pack(side="left")
         self.block_var = tk.StringVar()
-        self.block_cb = ttk.Combobox(controls, textvariable=self.block_var, state="readonly", width=8)
+        self.block_cb = ttk.Combobox(controls, textvariable=self.block_var, state="readonly", width=10)
         self.block_cb.pack(side="left", padx=(4, 10))
         self.block_cb.bind("<<ComboboxSelected>>", lambda e: self.on_block_selected())
         self.range_control = UniformRangeControl(controls, on_change=self.refresh)
@@ -362,24 +364,31 @@ class BlockDetailTab(ttk.Frame):
         self.panel.pack(side="left", fill="both", expand=True)
 
     def on_session_changed(self):
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_var.get() or None
+        sessions = self.app.get_selected_sessions()
         self.block_cb["values"] = []
         self.block_var.set("")
-        if subject_id is None or session is None:
+        self._blocks_by_label = {}
+        if subject_id is None or not sessions:
             self.trial_listbox.delete(0, "end")
             self.panel.clear()
             self.app.update_shared_sample_interval()
             return
+        multi_session = len(sessions) > 1
         try:
-            blocks = sorted((self.app.experiment.Block()
-                              & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+            pairs = []
+            for session in sessions:
+                blocks = sorted((self.app.experiment.Block()
+                                  & {"subject_id": subject_id, "session": session}).fetch("block").tolist())
+                pairs.extend((session, block) for block in blocks)
         except Exception as exc:
             self.app.report_error(exc)
             return
-        values = [str(b) for b in blocks]
-        self.block_cb["values"] = values
-        if values:
-            self.block_var.set(values[0])
+        labels = [f"s{session} b{block}" if multi_session else str(block) for session, block in pairs]
+        self._blocks_by_label = dict(zip(labels, pairs))
+        self.block_cb["values"] = labels
+        if labels:
+            self.block_var.set(labels[0])
             self.on_block_selected()
         else:
             self.trial_listbox.delete(0, "end")
@@ -391,13 +400,17 @@ class BlockDetailTab(ttk.Frame):
         self.app.update_shared_sample_interval()
         self.refresh()
 
+    def get_selected_session_block(self):
+        """(session, block) for whatever's currently picked in block_var, or (None, None)."""
+        return self._blocks_by_label.get(self.block_var.get(), (None, None))
+
     def reload_trials(self):
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.block_var.get()
+        subject_id = self.app.subject_var.get() or None
+        session, block = self.get_selected_session_block()
         self.trial_listbox.delete(0, "end")
-        if subject_id is None or session is None or not block_str:
+        if subject_id is None or session is None:
             return
-        key = {"subject_id": subject_id, "session": session, "block": int(block_str)}
+        key = {"subject_id": subject_id, "session": session, "block": block}
         try:
             trials = sorted((self.app.experiment.BehaviorTrial() & key).fetch("trial").tolist())
         except Exception as exc:
@@ -418,11 +431,10 @@ class BlockDetailTab(ttk.Frame):
         return [int(self.trial_listbox.get(i)) for i in self.trial_listbox.curselection()]
 
     def refresh(self):
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.block_var.get()
-        if subject_id is None or session is None or not block_str:
+        subject_id = self.app.subject_var.get() or None
+        session, block = self.get_selected_session_block()
+        if subject_id is None or session is None:
             return
-        block = int(block_str)
         selected_trials = self.get_selected_trials()
         from ndnf_pipeline.plot.behavior_plots import plot_block_force_figure
 
@@ -605,6 +617,7 @@ class VideoGenerationTab(ttk.Frame):
         self._preview_clims_2 = None
         self._output_path = None
         self._render_queue = queue.Queue()
+        self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
         self._inherited_trial_end = None
@@ -715,11 +728,17 @@ class VideoGenerationTab(ttk.Frame):
 
     # --- inherit block/trials from the Block Detail tab ---
     def on_session_changed(self):
-        self.reload_cameras()
+        # sync first so _inherited_session reflects the actual session of whatever block is
+        # selected in Block Detail (which may not be the app's "primary" selected session, once
+        # more than one session is selected) - reload_cameras then uses that.
         self.sync_from_block_detail()
+        self.reload_cameras()
 
     def reload_cameras(self):
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_var.get() or None
+        session = self._inherited_session
+        if session is None:
+            _, session = self.app.get_selected_subject_session()
         self.camera_cb["values"] = []
         self.camera_var.set("")
         self.camera_2_cb["values"] = []
@@ -750,38 +769,43 @@ class VideoGenerationTab(ttk.Frame):
     def sync_from_block_detail(self):
         """Re-read the Block Detail tab's block + trial selection (none selected there = every
         trial in the block) and convert it into the block-relative trial_start/trial_end indices
-        load_trial_video_data expects."""
+        load_trial_video_data expects. The session comes from whichever (session, block) Block
+        Detail currently has picked - not necessarily the app's "primary" selected session, once
+        more than one session is selected there."""
+        self._inherited_session = None
         self._inherited_block = None
         self._inherited_trial_start = None
         self._inherited_trial_end = None
-        subject_id, session = self.app.get_selected_subject_session()
-        block_str = self.app.block_detail_tab.block_var.get()
-        if subject_id is None or session is None or not block_str:
+        subject_id = self.app.subject_var.get() or None
+        session, block = self.app.block_detail_tab.get_selected_session_block()
+        if subject_id is None or session is None:
             self.inherited_label_var.set("(switch to the Block Detail tab and pick a block first)")
             return
+        block_label = self.app.block_detail_tab.block_var.get()
         try:
             all_trials = sorted((self.app.experiment.BehaviorTrial()
-                                  & {"subject_id": subject_id, "session": session, "block": int(block_str)}
+                                  & {"subject_id": subject_id, "session": session, "block": block}
                                   ).fetch("trial").tolist())
         except Exception as exc:
             self.app.report_error(exc)
             return
         if not all_trials:
-            self.inherited_label_var.set(f"Block {block_str}: no trials in this block")
+            self.inherited_label_var.set(f"Block {block_label}: no trials in this block")
             return
         selected = self.app.block_detail_tab.get_selected_trials()
         chosen = sorted(t for t in selected if t in all_trials) if selected else all_trials
         if not chosen:
-            self.inherited_label_var.set(f"Block {block_str}: the selected trials aren't in this block")
+            self.inherited_label_var.set(f"Block {block_label}: the selected trials aren't in this block")
             return
-        self._inherited_block = int(block_str)
+        self._inherited_session = session
+        self._inherited_block = block
         self._inherited_trial_start = all_trials.index(min(chosen))
         self._inherited_trial_end = all_trials.index(max(chosen))
         if selected:
-            self.inherited_label_var.set(f"Block {block_str}: trials {min(chosen)}-{max(chosen)} "
+            self.inherited_label_var.set(f"Block {block_label}: trials {min(chosen)}-{max(chosen)} "
                                           f"({len(chosen)} of {len(all_trials)} selected)")
         else:
-            self.inherited_label_var.set(f"Block {block_str}: all {len(all_trials)} trials "
+            self.inherited_label_var.set(f"Block {block_label}: all {len(all_trials)} trials "
                                           f"(trial numbers {all_trials[0]}-{all_trials[-1]})")
 
     # --- widget value parsing ---
@@ -803,7 +827,8 @@ class VideoGenerationTab(ttk.Frame):
         """Read + validate the inherited block/trial-range plus the camera selection(s). Returns
         load_trial_video_data kwargs, or None (after reporting the problem) if something
         required is missing/invalid."""
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_var.get() or None
+        session = self._inherited_session
         camera = self.camera_var.get()
         camera_2 = self.camera_2_var.get() if self.use_camera_2.get() else None
         if subject_id is None or session is None:
@@ -949,7 +974,8 @@ class VideoGenerationTab(ttk.Frame):
         self._preview_fig = fig
 
     def choose_output_path(self):
-        subject_id, session = self.app.get_selected_subject_session()
+        subject_id = self.app.subject_var.get() or None
+        session = self._inherited_session
         camera = self.camera_var.get()
         camera_suffix = camera
         if self.use_camera_2.get() and self.camera_2_var.get():
@@ -1063,11 +1089,17 @@ class BehaviorGUI(tk.Tk):
         self.subject_cb.pack(side="left", padx=(4, 16))
         self.subject_cb.bind("<<ComboboxSelected>>", lambda e: self.on_subject_selected())
 
-        ttk.Label(bar, text="Session:").pack(side="left")
-        self.session_var = tk.StringVar()
-        self.session_cb = ttk.Combobox(bar, textvariable=self.session_var, state="readonly", width=28)
-        self.session_cb.pack(side="left", padx=(4, 16))
-        self.session_cb.bind("<<ComboboxSelected>>", lambda e: self.on_session_selected())
+        ttk.Label(bar, text="Session(s):").pack(side="left")
+        session_frame = ttk.Frame(bar)
+        session_frame.pack(side="left", padx=(4, 4))
+        self.session_listbox = tk.Listbox(session_frame, selectmode="extended", exportselection=False,
+                                           width=26, height=4)
+        session_scrollbar = ttk.Scrollbar(session_frame, orient="vertical", command=self.session_listbox.yview)
+        self.session_listbox.configure(yscrollcommand=session_scrollbar.set)
+        self.session_listbox.pack(side="left")
+        session_scrollbar.pack(side="left", fill="y")
+        self.session_listbox.bind("<<ListboxSelect>>", lambda e: self.on_session_selected())
+        ttk.Label(bar, text="(ctrl/shift-click to compare several)", foreground="gray").pack(side="left", padx=(4, 16))
 
     def _build_shared_force_controls(self):
         """Epoch selection and trace filtering apply to force data, not to a specific tab, so
@@ -1096,9 +1128,9 @@ class BehaviorGUI(tk.Tk):
         if subject_id is None or session is None:
             self.filter_controls.set_sample_interval(None)
             return
-        block_str = self.block_detail_tab.block_var.get()
-        if block_str:
-            block = int(block_str)
+        block_session, block = self.block_detail_tab.get_selected_session_block()
+        if block is not None:
+            session = block_session
         else:
             try:
                 blocks = sorted((self.experiment.Block()
@@ -1223,8 +1255,7 @@ class BehaviorGUI(tk.Tk):
 
     def populate_sessions(self):
         subject_id = self.subject_var.get()
-        self.session_cb["values"] = []
-        self.session_var.set("")
+        self.session_listbox.delete(0, "end")
         self._sessions_by_label = {}
         if not subject_id or self.experiment is None:
             self._notify_tabs("on_session_changed")
@@ -1237,9 +1268,12 @@ class BehaviorGUI(tk.Tk):
             return
         labels = [f"{s} — {d}" for s, d in zip(sessions, dates)]
         self._sessions_by_label = dict(zip(labels, sessions.tolist()))
-        self.session_cb["values"] = labels
+        for label in labels:
+            self.session_listbox.insert("end", label)
+        # default to the most recent session only - multi-session comparison is opt-in
+        # (ctrl/shift-click more sessions in the listbox)
         if labels:
-            self.session_var.set(labels[0])
+            self.session_listbox.selection_set(0)
         self.on_session_selected()
 
     def on_session_selected(self):
@@ -1251,10 +1285,18 @@ class BehaviorGUI(tk.Tk):
             if hook is not None:
                 hook()
 
+    def get_selected_sessions(self):
+        """Every currently selected session, sorted ascending (chronological by session id)."""
+        labels = [self.session_listbox.get(i) for i in self.session_listbox.curselection()]
+        return sorted(self._sessions_by_label[label] for label in labels)
+
     def get_selected_subject_session(self):
+        """Subject + the "primary" (first) selected session, for tabs that only need one -
+        Subject Trend / Trials per Mouse / Water Restriction use just the subject, and the
+        shared sample-interval hint falls back to this when Block Detail has no block picked."""
         subject_id = self.subject_var.get() or None
-        session = self._sessions_by_label.get(self.session_var.get())
-        return subject_id, session
+        sessions = self.get_selected_sessions()
+        return subject_id, (sessions[0] if sessions else None)
 
     # --- plotting / error helpers ---
     def run_plot(self, work_fn, panel):
