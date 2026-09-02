@@ -877,7 +877,7 @@ class VideoGenerationTab:
                     **self.app.filter_controls.get_filter_kwargs())
 
     def _quality_preset(self):
-        return self._quality_presets.get(self.quality_select.value, self._quality_presets['high'])
+        return self._quality_presets.get(self.quality_select.value, self._quality_presets['ultra'])
 
     def _render_kwargs(self):
         return dict(

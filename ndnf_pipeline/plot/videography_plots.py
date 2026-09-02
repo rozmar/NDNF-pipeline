@@ -18,17 +18,17 @@ from ndnf_pipeline.plot.behavior_plots import (
 # Quality presets for the "Generate Video" GUIs. dpi is the dominant cost of rendering (it sets
 # how many pixels each frame is rasterized at in _render_frame_chunk's savefig call - the
 # CPU-bound step render_trial_video parallelizes across workers), so 'low' renders much faster
-# than 'high'; bitrate only affects the final ffmpeg encode's file size/quality at that
-# resolution. 'high' matches what render_trial_video/save_render_params/preview_last_frame have
-# always defaulted to, so it reproduces exactly what every render looked like before this preset
-# dropdown existed.
+# than 'ultra'; bitrate only affects the final ffmpeg encode's file size/quality at that
+# resolution. 'ultra' matches what render_trial_video/save_render_params/preview_last_frame
+# defaulted to before this preset dropdown existed; the GUIs default to 'low' instead so a quick
+# look renders fast, and only step up to 'ultra' for a final/shareable video.
 VIDEO_QUALITY_PRESETS = {
-    'low':    dict(dpi=80,  bitrate='1200k'),
-    'medium': dict(dpi=110, bitrate='2000k'),
-    'high':   dict(dpi=150, bitrate='3000k'),
-    'ultra':  dict(dpi=220, bitrate='6000k'),
+    'low':    dict(dpi=50,  bitrate='700k'),
+    'medium': dict(dpi=80,  bitrate='1200k'),
+    'high':   dict(dpi=115, bitrate='2000k'),
+    'ultra':  dict(dpi=150, bitrate='3000k'),
 }
-VIDEO_QUALITY_DEFAULT = 'high'
+VIDEO_QUALITY_DEFAULT = 'low'
 
 _LABELS = {
     'en': dict(time='Time (s)', feedback='Feedback',
