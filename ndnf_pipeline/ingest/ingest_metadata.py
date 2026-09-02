@@ -45,7 +45,7 @@ def ingest_metadata(dj):
     ingest_surgeries(dj)
     ingest_death(dj)
     ingest_water_restriction(dj)
-    ingest_environment(dj)
+    #ingest_environment(dj)
 
 def ingest_experimenters(dj):
     metadata_path = dj.config['path.metadata']
@@ -229,7 +229,7 @@ def ingest_mouse_lines(dj):
     for mouseline in df_mouselines.iterrows():
         mouseline = mouseline[1]
         mouselinedata = {
-                'mouse_line': mouseline['Mouse Line ID'],
+                'mouse_line': str(mouseline['Mouse Line ID']).strip(),
                 'line_description': mouseline['Mouse Line Description'],
                 'jax_stock_number': mouseline['JAX#'] if not pd.isna(mouseline['JAX#']) else None,
                 }
@@ -258,9 +258,12 @@ def ingest_surgeries(dj):
         lineage_list = []
         genotypeidx = 1
         while 'genotype_'+str(genotypeidx) in item.keys():
-            if type(item['genotype_'+str(genotypeidx)]) == str and item['genotype_'+str(genotypeidx)] != '' and item['genotype_'+str(genotypeidx)] != '-':
+            genotype_val = item['genotype_'+str(genotypeidx)]
+            if type(genotype_val) == str:
+                genotype_val = genotype_val.strip()
+            if type(genotype_val) == str and genotype_val != '' and genotype_val != '-':
                 lineage_list.append( {'subject_id':subjectdata['subject_id'],
-                                    'mouse_line':item['genotype_'+str(genotypeidx)], 
+                                    'mouse_line':genotype_val,
                                     'zygosity':'Unknown'} )
             genotypeidx += 1
         try:
@@ -268,6 +271,11 @@ def ingest_surgeries(dj):
         except dj.errors.DuplicateError:
             print('duplicate. animal :',item['animal#'], ' already exists')
         for lineage in lineage_list:
+            if len(lab.MouseLine() & {'mouse_line': lineage['mouse_line']}) == 0:
+                print('ERROR: mouse line "{}" (animal {}) is not registered in MouseLine - '
+                      'check for typos/whitespace or add it to "NDNF animals_Mouse lines.csv". Skipping.'.format(
+                          lineage['mouse_line'], item['animal#']))
+                continue
             try:
                 lab.Subject.Lineage().insert1(lineage)
             except dj.errors.DuplicateError:
