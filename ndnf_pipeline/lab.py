@@ -92,10 +92,11 @@ class WaterRestriction(dj.Manual):
         log_datetime         : datetime
         ---
         ->Person
-        weight               : Decimal(4,2)       # weight (g)
-        water_given          : Decimal(4,3)       # total water intake (ml)
-        water_earned = null  : Decimal(4,3)       # water earned during session (ml)
-        notes                : varchar(256)
+        weight                          : Decimal(4,2)       # weight (g)
+        weight_after_watering = null    : Decimal(4,2)       # weight after watering (g)
+        water_given                     : Decimal(4,3)       # total water intake (ml)
+        water_earned = null             : Decimal(4,3)       # water earned during session (ml)
+        notes                           : varchar(256)
         """
 
 

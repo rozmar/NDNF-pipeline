@@ -1,7 +1,7 @@
 # this script downloads metadata, ingests data
 #%% 1: connect to datajoint using the local config file
 import datajoint as dj
-dj.config.load('C:\\Secrets\\dj_local_conf.json')
+dj.config.load("C:\\Secrets\\dj_local_conf.json")
 dj.conn()
 #%% 2: update metadata from google drive
 from ndnf_pipeline.utils.google_notebook import update_metadata
