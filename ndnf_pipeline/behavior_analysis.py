@@ -252,7 +252,10 @@ class TrialTouchTimes(dj.Computed):
         force_magnitude_smooth = np.sqrt(sum(smoothed[ax][:n_smooth] ** 2 for ax in smoothed))
 
         force_magnitude_smooth_sd = pd.Series(force_magnitude_smooth).rolling(window=sd_window).std()
-        contact_times = (force_magnitude_smooth_sd > params['sd_threshold']).fillna(False).values
+        # .copy(): pandas may return a read-only view here (observed with the currently
+        # installed pandas' copy-on-write behavior), but contact_times is mutated in place
+        # below (|= and boolean-mask assignment), so it must be a writable, owned array.
+        contact_times = (force_magnitude_smooth_sd > params['sd_threshold']).fillna(False).values.copy()
 
         # High force magnitude is always touch, regardless of SD
         contact_times |= (force_magnitude_smooth > params['force_threshold'])
@@ -385,24 +388,132 @@ def _menger_curvature_radius(x, y, half_window=5):
     return radius
 
 
+def _merge_weak_submovements(all_subm, min_peak_speed=None, min_duration=None):
+    """Fold any submovement that fails to clear `min_peak_speed` (g/sample) and/or
+    `min_duration` (s) into the *next* segment in `all_subm`, rather than counting it
+    as a distinct submovement -- pure signal-amplitude filtering, independent of target
+    position/geometry. `all_subm` must already be in time order and share a single
+    contiguous epoch (callers must not mix segments across a no-touch gap). Does not
+    re-number `submovement_idx`; callers are responsible for that."""
+    if not all_subm:
+        return list(all_subm)
+    merged = [dict(all_subm[0])]
+    for seg in all_subm[1:]:
+        prev = merged[-1]
+        weak = ((min_peak_speed is not None and prev['peak_speed'] < min_peak_speed) or
+                (min_duration is not None and prev['duration'] < min_duration))
+        if weak:
+            # fold `prev` into `seg`: extend seg's start back to prev's start time
+            seg = dict(seg)
+            seg['start_time'] = prev['start_time']
+            seg['duration']   = seg['end_time'] - seg['start_time']
+            seg['peak_speed'] = max(prev['peak_speed'], seg['peak_speed'])
+            merged[-1] = seg
+        else:
+            merged.append(dict(seg))
+    return merged
+
+
+def _lut_target_position(key):
+    """(tgt_f0, tgt_f1): force-axis-0/1 coordinates of the target_force_lut peak for the
+    block this trial (subject_id/session/trial in `key`) belongs to. `target_force_lut` is
+    fixed per block (one task_setting_id per block), so this is the same point for every
+    trial in that block -- see the LUT-peak convention already used for visualization in
+    behavior_analysis_Riddhi.ipynb / behaviour_analysis_Riddhi(mouse).ipynb."""
+    block = (experiment.BehaviorTrial & key).fetch1('block')
+    task_key = {'subject_id': key['subject_id'], 'session': key['session']}
+    task_setting_id = (experiment.Block & {**task_key, 'block': block}).fetch1('task_setting_id')
+    lut = (experiment.TaskSettings & {**task_key, 'task_setting_id': task_setting_id}).fetch1('target_force_lut')
+    ax_idx, ax_val = (
+        experiment.TaskSettings.ForceAxis & {**task_key, 'task_setting_id': task_setting_id}
+    ).fetch('force_axis_idx', 'target_force_axes', order_by='force_axis_idx')
+    fa = {int(i): v for i, v in zip(ax_idx, ax_val)}
+    peak_i, peak_j = np.unravel_index(np.nanargmax(lut), lut.shape)
+    return float(fa[0][peak_i]), float(fa[1][peak_j])
+
+
 @schema
 class SubmovementDetectionParams(dj.Lookup):
+    """Each row is a fully independent, immutable submovement-detection recipe -- once a
+    subm_param_id has real Submovement rows computed under it, its definition should not
+    change; add a new subm_param_id instead (as was done for id 2 below) so existing
+    results stay reproducible.
+
+    subm_param_id 0 -- speed_curvature_cooccurrence (humans): a boundary is only accepted
+      where a local minimum of speed and a local minimum of curvature radius co-occur.
+      Tuned on human data. See _boundaries_speed_curvature_cooccurrence.
+
+    subm_param_id 1 -- target_projected_zero_crossing (mice, raw): a boundary is declared
+      wherever the velocity's projection onto the direction-to-target reverses sign (net
+      progress toward vs. away from the block's LUT target). No amplitude filtering --
+      every sign reversal counts, including low-speed noise wobbles. See
+      _boundaries_target_projected_zero_crossing.
+
+    subm_param_id 2 -- target_projected_zero_crossing_gated (mice, gated): the
+      same zero-crossing rule as subm_param_id 1, but within each touch epoch a segment
+      whose peak_speed doesn't clear `speed_prominence` is merged into its neighbor
+      instead of counting as its own submovement. Target-geometry-free (it only looks at
+      segment speed, never at LUT/target position) -- this is "option 6" from the
+      "target is a region, not a point" discussion, validated in-notebook before being
+      added here as its own param id rather than changing id 1's behavior. See
+      _boundaries_target_projected_zero_crossing_amplitude_gated and
+      _merge_weak_submovements.
+    """
     definition = """
     subm_param_id: smallint
     ---
-    smooth_window_time: float        # (s) boxcar smoothing for force traces before derivative
-    curvature_half_window: int       # samples, half-window for Menger radius (each side)
-    min_submovement_duration: float  # (s) minimum distance between segment boundaries
-    speed_prominence: float          # minimum prominence of a speed local minimum (g/sample)
-    cooccurrence_window_time: float  # (s) max lag between matched speed and curvature minima
+    detection_method: varchar(40)    # 'speed_curvature_cooccurrence', 'target_projected_zero_crossing', or 'target_projected_zero_crossing_gated'
+    smooth_window_time: float        # (s) boxcar smoothing for force traces before derivative -- used by all methods
+    min_submovement_duration: float  # (s) minimum distance between segment boundaries -- used by all methods
+    curvature_half_window: int       # samples, half-window for Menger radius (each side) -- speed_curvature_cooccurrence only, ignored otherwise
+    speed_prominence: float          # (g/sample) speed_curvature_cooccurrence: minimum prominence of a speed local minimum. target_projected_zero_crossing_gated: minimum peak_speed a segment must clear to avoid being merged into its neighbor (the amplitude gate in _merge_weak_submovements). Ignored by target_projected_zero_crossing.
+    cooccurrence_window_time: float  # (s) max lag between matched speed and curvature minima -- speed_curvature_cooccurrence only, ignored otherwise
     """
     contents = [
+        # subm_param_id 0: original method, tuned on human data. A boundary is only
+        # accepted where a local minimum of speed and a local minimum of curvature
+        # co-occur -- see _menger_curvature_radius and TrialSubmovements.make().
         {'subm_param_id': 0,
+         'detection_method': 'speed_curvature_cooccurrence',
          'smooth_window_time': 0.03,
-         'curvature_half_window': 5,
          'min_submovement_duration': 0.05,
+         'curvature_half_window': 5,
          'speed_prominence': 0.05,
-         'cooccurrence_window_time': 0.05}
+         'cooccurrence_window_time': 0.05},
+        # subm_param_id 1: for mouse data. A boundary is declared wherever the velocity's
+        # projection onto the direction-to-target reverses sign (motion switches between
+        # net progress toward vs. away from the block's LUT target) -- see
+        # _lut_target_position and TrialSubmovements.make(). Needs no curvature/prominence
+        # tuning, so those three columns are unused placeholders for this row.
+        # min_submovement_duration is set shorter than the human row (0.03s vs 0.05s):
+        # mice appear to execute discrete corrective adjustments faster than humans in
+        # this task, and the human-tuned 50 ms floor risked merging genuinely separate
+        # quick mouse corrections into one. smooth_window_time is left the same as the
+        # human row since it only performs generic anti-aliasing smoothing before taking
+        # a derivative, not something species movement-timescale should affect.
+        {'subm_param_id': 1,
+         'detection_method': 'target_projected_zero_crossing',
+         'smooth_window_time': 0.03,
+         'min_submovement_duration': 0.03,
+         'curvature_half_window': 0,
+         'speed_prominence': 0.0,
+         'cooccurrence_window_time': 0.0},
+        # subm_param_id 2: same base rule as subm_param_id 1 (same smooth_window_time /
+        # min_submovement_duration, tuned for mice the same way), plus a post-detection
+        # amplitude gate: a segment weaker than speed_prominence gets merged into its
+        # neighbor rather than counted as its own submovement -- see
+        # _merge_weak_submovements. curvature_half_window and cooccurrence_window_time
+        # remain unused placeholders. speed_prominence=0.05 was validated in-notebook
+        # (M036 s4b1: 11192 raw zero-crossing segments -> 8315 after gating) before being
+        # added here as its own param id, so subm_param_id=1's already-populated rows
+        # keep meaning exactly what they always have.
+        {'subm_param_id': 2,
+         'detection_method': 'target_projected_zero_crossing_gated',
+         'smooth_window_time': 0.03,
+         'min_submovement_duration': 0.03,
+         'curvature_half_window': 0,
+         'speed_prominence': 0.05,
+         'cooccurrence_window_time': 0.0},
     ]
 
 
@@ -427,8 +538,6 @@ class TrialSubmovements(dj.Computed):
         """
 
     def make(self, key):
-        from scipy.signal import find_peaks
-
         params = (SubmovementDetectionParams & key).fetch1()
 
         force_trace_time = (experiment.TrialForceTrace & key).fetch1('force_trace_time')
@@ -439,9 +548,7 @@ class TrialSubmovements(dj.Computed):
         sample_interval = float(np.median(np.diff(force_trace_time)))
         smooth_window = max(1, int(params['smooth_window_time'] / sample_interval))
         min_dist      = max(2, int(params['min_submovement_duration'] / sample_interval))
-        cooc_win      = max(1, int(params['cooccurrence_window_time'] / sample_interval))
         half_w        = smooth_window // 2
-        curv_hw       = int(params['curvature_half_window'])
 
         axis_indices, axis_values = (
             experiment.TrialForceTrace.TrialForceAxis & key & 'force_axis_idx < 2'
@@ -463,19 +570,45 @@ class TrialSubmovements(dj.Computed):
         if len(t) < n:
             t = force_trace_time[0] + np.arange(n) * sample_interval
 
-        # Speed in force space (one sample shorter than trace)
+        # Speed in force space (one sample shorter than trace) -- shared by both methods
         mag = np.sqrt(np.diff(f0) ** 2 + np.diff(f1) ** 2)
-        # Radius of curvature (same length as trace)
-        curv_r = _menger_curvature_radius(f0, f1, half_window=curv_hw)
 
         # Restrict search to is_touch = True epochs only
         touch_starts, touch_ends = (
             TrialTouchTimes.TouchEpoch & key & {'is_touch': True}
         ).fetch('start_time', 'end_time', order_by='epoch_idx')
 
+        if params['detection_method'] == 'speed_curvature_cooccurrence':
+            all_subm = self._boundaries_speed_curvature_cooccurrence(
+                key, params, f0, f1, t, mag, touch_starts, touch_ends, min_dist)
+        elif params['detection_method'] == 'target_projected_zero_crossing':
+            all_subm = self._boundaries_target_projected_zero_crossing(
+                key, f0, f1, t, mag, touch_starts, touch_ends, min_dist)
+        elif params['detection_method'] == 'target_projected_zero_crossing_gated':
+            all_subm = self._boundaries_target_projected_zero_crossing_amplitude_gated(
+                key, params, f0, f1, t, mag, touch_starts, touch_ends, min_dist)
+        else:
+            raise ValueError(f"Unknown detection_method {params['detection_method']!r} "
+                              f"for subm_param_id={key['subm_param_id']}")
+
+        self.insert1({**key, 'n_submovements': len(all_subm)})
+        self.Submovement.insert(all_subm)
+
+    @staticmethod
+    def _boundaries_speed_curvature_cooccurrence(key, params, f0, f1, t, mag,
+                                                  touch_starts, touch_ends, min_dist):
+        """subm_param_id 0 (humans): a boundary is only accepted where a local minimum
+        of speed and a local minimum of curvature radius co-occur within
+        `cooccurrence_window_time` of each other."""
+        from scipy.signal import find_peaks
+
+        sample_interval = float(np.median(np.diff(t))) if len(t) > 1 else 1.0
+        cooc_win = max(1, int(params['cooccurrence_window_time'] / sample_interval))
+        curv_hw  = int(params['curvature_half_window'])
+        curv_r = _menger_curvature_radius(f0, f1, half_window=curv_hw)
+
         all_subm = []
         subm_idx = 0
-
         for t_start, t_end in zip(touch_starts, touch_ends):
             i0 = int(np.searchsorted(t, float(t_start)))
             i1 = int(np.searchsorted(t, float(t_end)))
@@ -511,20 +644,160 @@ class TrialSubmovements(dj.Computed):
                 abs_e = j0 + e
                 if abs_s >= len(t) or abs_e >= len(t):
                     continue
-                duration = float(t[abs_e] - t[abs_s])
-                peak_spd = float(np.max(mag[abs_s:abs_e])) if abs_e > abs_s else 0.0
                 all_subm.append({
                     **key,
                     'submovement_idx': subm_idx,
                     'start_time':      float(t[abs_s]),
                     'end_time':        float(t[abs_e]),
-                    'duration':        duration,
-                    'peak_speed':      peak_spd,
+                    'duration':        float(t[abs_e] - t[abs_s]),
+                    'peak_speed':      float(np.max(mag[abs_s:abs_e])) if abs_e > abs_s else 0.0,
                 })
                 subm_idx += 1
+        return all_subm
 
-        self.insert1({**key, 'n_submovements': subm_idx})
-        self.Submovement.insert(all_subm)
+    @staticmethod
+    def _boundaries_target_projected_zero_crossing(key, f0, f1, t, mag,
+                                                     touch_starts, touch_ends, min_dist):
+        """subm_param_id 1 (mice, raw): projects the instantaneous velocity onto the
+        direction from the current force position to the block's LUT target, and
+        declares a submovement boundary at each sign change of that projection -- i.e.
+        wherever motion reverses between making progress toward the target and moving
+        away from it. Needs no curvature/prominence tuning; the direction reversal
+        itself defines the boundary. `peak_speed` is still computed from `mag` (shared
+        with the other method) so the two methods' Submovement rows remain directly
+        comparable."""
+        tgt_f0, tgt_f1 = _lut_target_position(key)
+
+        dx = tgt_f0 - f0
+        dy = tgt_f1 - f1
+        dist = np.clip(np.hypot(dx, dy), 1e-9, None)
+        ux, uy = dx / dist, dy / dist
+
+        vx = np.diff(f0)
+        vy = np.diff(f1)
+        # proj[i] = velocity at step i, projected onto the direction-to-target measured
+        # at the start of that step (ux/uy is one sample longer than vx/vy)
+        proj = vx * ux[:-1] + vy * uy[:-1]
+
+        all_subm = []
+        subm_idx = 0
+        for t_start, t_end in zip(touch_starts, touch_ends):
+            i0 = int(np.searchsorted(t, float(t_start)))
+            i1 = int(np.searchsorted(t, float(t_end)))
+            if i1 - i0 < min_dist:
+                continue
+
+            j0, j1 = i0, min(i1, len(proj))
+            proj_ep = proj[j0:j1]
+            sign_ep = np.sign(proj_ep)
+            sign_ep[sign_ep == 0] = 1  # an exact zero continues the current sign, not its own crossing
+            crossings = np.flatnonzero(np.diff(sign_ep) != 0) + 1  # first sample of the new sign
+
+            # enforce the same minimum-spacing rule as the co-occurrence method, so two
+            # crossings too close together (noise-driven sign flicker) aren't both kept
+            boundaries = []
+            last = -min_dist
+            for c in crossings:
+                if c - last >= min_dist:
+                    boundaries.append(int(c))
+                    last = c
+
+            seg_starts = [0] + boundaries
+            seg_ends   = boundaries + [len(proj_ep) - 1]
+
+            for s, e in zip(seg_starts, seg_ends):
+                if e <= s:
+                    continue
+                abs_s = j0 + s
+                abs_e = j0 + e
+                if abs_s >= len(t) or abs_e >= len(t):
+                    continue
+                all_subm.append({
+                    **key,
+                    'submovement_idx': subm_idx,
+                    'start_time':      float(t[abs_s]),
+                    'end_time':        float(t[abs_e]),
+                    'duration':        float(t[abs_e] - t[abs_s]),
+                    'peak_speed':      float(np.max(mag[abs_s:abs_e])) if abs_e > abs_s else 0.0,
+                })
+                subm_idx += 1
+        return all_subm
+
+    @staticmethod
+    def _boundaries_target_projected_zero_crossing_amplitude_gated(key, params, f0, f1, t, mag,
+                                                                     touch_starts, touch_ends, min_dist):
+        """subm_param_id 2 (mice, gated): identical detection rule to subm_param_id 1's
+        _boundaries_target_projected_zero_crossing above (duplicated here rather than
+        shared, so that function's behavior for subm_param_id=1's already-populated
+        data can never change), except that within each touch epoch the resulting
+        segments go through a minimum-amplitude gate (`_merge_weak_submovements`): any
+        segment whose peak_speed doesn't clear `params['speed_prominence']` (g/sample)
+        is merged into the next segment instead of counting as its own submovement.
+        This is target-geometry-free -- it never looks at the LUT/target position, only
+        at how fast each segment was -- purely to stop low-speed noise wobbles from
+        each registering as a separate correction. Set `speed_prominence` to 0 to
+        disable the gate and get the raw zero-crossing boundaries (equivalent to
+        subm_param_id 1)."""
+        tgt_f0, tgt_f1 = _lut_target_position(key)
+
+        dx = tgt_f0 - f0
+        dy = tgt_f1 - f1
+        dist = np.clip(np.hypot(dx, dy), 1e-9, None)
+        ux, uy = dx / dist, dy / dist
+
+        vx = np.diff(f0)
+        vy = np.diff(f1)
+        proj = vx * ux[:-1] + vy * uy[:-1]
+
+        all_subm = []
+        subm_idx = 0
+        for t_start, t_end in zip(touch_starts, touch_ends):
+            i0 = int(np.searchsorted(t, float(t_start)))
+            i1 = int(np.searchsorted(t, float(t_end)))
+            if i1 - i0 < min_dist:
+                continue
+
+            j0, j1 = i0, min(i1, len(proj))
+            proj_ep = proj[j0:j1]
+            sign_ep = np.sign(proj_ep)
+            sign_ep[sign_ep == 0] = 1  # an exact zero continues the current sign, not its own crossing
+            crossings = np.flatnonzero(np.diff(sign_ep) != 0) + 1  # first sample of the new sign
+
+            boundaries = []
+            last = -min_dist
+            for c in crossings:
+                if c - last >= min_dist:
+                    boundaries.append(int(c))
+                    last = c
+
+            seg_starts = [0] + boundaries
+            seg_ends   = boundaries + [len(proj_ep) - 1]
+
+            epoch_subm = []
+            for s, e in zip(seg_starts, seg_ends):
+                if e <= s:
+                    continue
+                abs_s = j0 + s
+                abs_e = j0 + e
+                if abs_s >= len(t) or abs_e >= len(t):
+                    continue
+                epoch_subm.append({
+                    **key,
+                    'submovement_idx': 0,  # re-numbered below, after the amplitude gate
+                    'start_time':      float(t[abs_s]),
+                    'end_time':        float(t[abs_e]),
+                    'duration':        float(t[abs_e] - t[abs_s]),
+                    'peak_speed':      float(np.max(mag[abs_s:abs_e])) if abs_e > abs_s else 0.0,
+                })
+
+            # amplitude gate applied within this touch epoch only -- merging across epochs
+            # would splice a segment's start_time across an intervening no-touch gap
+            epoch_subm = _merge_weak_submovements(epoch_subm, min_peak_speed=params['speed_prominence'])
+            for seg in epoch_subm:
+                seg['submovement_idx'] = subm_idx
+                all_subm.append(seg)
+                subm_idx += 1
+        return all_subm
 
 
 @schema
