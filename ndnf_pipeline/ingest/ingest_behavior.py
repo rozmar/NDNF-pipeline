@@ -414,7 +414,7 @@ def ingest_behavior_sessions(dj):
                 elif data_version == 'v2':
                     hit =np.asarray([a['data'] for a in data_dict[reward_string]])==True
 
-                lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'))
+                lickometer_data = harp.read(os.path.join(session_dir,'behavior/Lickometer.harp/LicketySplit_32.bin'), columns=[0])
                 loadcell_data = harp.read(os.path.join(session_dir,"behavior/LoadCells.harp/LoadCells_33.bin"))
                 spout_csv = os.path.join(session_dir,'behavior/OperationControl/SpoutPosition.csv')
                 lickport_df = pd.read_csv(spout_csv)
