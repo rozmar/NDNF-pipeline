@@ -10,11 +10,68 @@ from PIL import Image
 from zoneinfo import ZoneInfo
 from ..analysis_log import log_execution
 #%%
+# per rig: camera name in the rig config -> device name in lab.Device (same physical camera)
+_CAMERA_ALIASES = {'Behavior_0': {'MainCamera': 'FrontCamera', 'SecondCamera': 'SideCamera'}}
+
 _SESSION_FORMATS = [
     '%Y%m%dT%H%M%S',
     '%Y-%m-%dT%H%M%SZ',
     '%Y-%m-%dT%H%M%S.%fZ',
 ]
+
+# Bonsai's LUT sampling order (Aind.Behavior.Telekinesis commit 1064097, deployed 2026-09-10 16:08 +0200):
+# before it, GetSubPixel2D read the TIFF as row <- Action0, col <- Action1; from then on as
+# row <- Action1, col <- Action0. Checked against CurrentActionVector.csv for every block whose LUT
+# can tell the two apart. 1D LUTs are always read row <- Action0.
+_LUT_ROW_ACTION_SWITCH = datetime(2026, 9, 10, 14, 8, 20, tzinfo=ZoneInfo('UTC'))
+# session folder -> row action, for folders whose logged sampling contradicts the date rule above
+_LUT_ROW_ACTION_OVERRIDES = {}
+
+
+def _lut_row_action(session_folder, folder_datetime, forcemap_im):
+    if forcemap_im.ndim < 2 or forcemap_im.shape[1] == 1:
+        return 0
+    if session_folder in _LUT_ROW_ACTION_OVERRIDES:
+        return _LUT_ROW_ACTION_OVERRIDES[session_folder]
+    return 0 if folder_datetime < _LUT_ROW_ACTION_SWITCH else 1
+
+
+def _rig_slopes(data_dict, rig_output_dict):
+    # per-channel load-cell slope Bonsai applied before sampling the LUT: Action = (raw - baseline) * slope.
+    # This is the 'Slope' of the rig file / task GUI, not the grams calibration. The value logged in
+    # the session wins; otherwise the rig file; otherwise 1.
+    slopes = {}
+    calibration = ((rig_output_dict or {}).get('harp_load_cells') or {}).get('calibration') or {}
+    for channel in calibration.get('channels') or []:
+        slopes[channel['channel']] = float(channel.get('slope', 1.0))
+    for entry in data_dict.get('LoadCellCalibration', []):
+        if 'Slope' in entry['data']:
+            slopes[entry['data']['LoadCellIndex']] = float(entry['data']['Slope'])
+    return slopes
+
+
+def _lut_in_channel_space(forcemap_im, action_limits, action_channel, row_action, p_to_g, rig_slopes):
+    # Re-express a block's LUT in the index space of TrialForceTrace.TrialForceAxis: array dim d is
+    # load-cell channel d, and target_force_axes[d] is that channel's force in grams (raw Harp sign,
+    # baseline-relative), ascending. Bonsai reads the TIFF with row <- Action[row_action] and
+    # col <- the other Action, where Action[a] = (raw[channel] - baseline) * rig_slope[channel] and
+    # pixel i along that dim sits at action_min + i * (action_max - action_min) / (n - 1).
+    lut = np.asarray(forcemap_im)
+    force_axes = {}
+    for dim, action in ((0, row_action), (1, 1 - row_action)):
+        channel = action_channel[action]
+        grams_per_unit = p_to_g[channel][0] / rig_slopes.get(channel, 1.0)
+        action_min, action_max = action_limits[action]
+        force_axes[channel] = np.linspace(grams_per_unit * action_min, grams_per_unit * action_max, lut.shape[dim])
+    if sorted(force_axes) != [0, 1]:
+        raise ValueError('LUT actions must be fed by load-cell channels 0 and 1, got {}'.format(action_channel))
+    if action_channel[row_action] != 0:
+        lut = lut.T
+    for dim in (0, 1):
+        if force_axes[dim][-1] < force_axes[dim][0]:
+            force_axes[dim] = force_axes[dim][::-1]
+            lut = np.flip(lut, axis=dim)
+    return np.ascontiguousarray(lut), force_axes
 
 def _to_float_or_none(value):
     try:
@@ -75,6 +132,7 @@ def _extract_block_trial_params(trial_statistics, data_version, tasklogic_dict, 
         cached_threshold = trial_statistics['left_harvest']['upper_force_threshold'] # old logic
         force_duration = trial_statistics['left_harvest']['force_duration'] # old logic
         start_end_mm = trial_statistics['left_harvest']['continuous_feedback']['converter_lut_output'] # old logic
+        action_channel = {0: 0, 1: 1}
     elif data_version in ['v2','v3']:
         reward_size = trial_statistics['response_period']['action']['reward_amount']['distribution_parameters']['value']
         valve_open_time = reward_size*0.05 # TODO make this calibrated!!!
@@ -96,6 +154,8 @@ def _extract_block_trial_params(trial_statistics, data_version, tasklogic_dict, 
             start_end_mm = [0,0]
         else:
             start_end_mm = trial_statistics['response_period']['action']['continuous_feedback']['converter_lut_output'] # new logic
+        # load-cell channel feeding each Action (LoadCellActionSource.channel, swapped on 2026-09-10)
+        action_channel = {a: (trial_statistics.get('action_source_{}'.format(a)) or {}).get('channel', a) for a in (0, 1)}
     return {
         'reward_size': reward_size,
         'valve_open_time': valve_open_time,
@@ -107,6 +167,7 @@ def _extract_block_trial_params(trial_statistics, data_version, tasklogic_dict, 
         'force_duration': force_duration,
         'start_end_mm': start_end_mm,
         'has_cue': has_cue,
+        'action_channel': action_channel,
     }
 
 def _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict, block_num, task_setting_id, feedback_type, first_trial_idx):
@@ -121,12 +182,16 @@ def _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session
             'block_end_time': sessiontrial_dict_list[-1]['trial_end_time'],
         })
 
-def ingest_behavior_sessions(dj):
+def ingest_behavior_sessions(dj, dry_run=False, only=None):
+    # dry_run: write nothing; re-process sessions that already exist (even if their trials are
+    # ingested) and return {(subject_id, session): {'task_settings', 'force_axes', 'blocks'}}.
+    # only: optional set of (subject_id, session_date) to restrict to.
     #%%
     df_surgery = pd.read_csv(dj.config['path.metadata']+'NDNF procedures_Surgeries.csv')
-    
+    dry_run_results = {}
+
     # Capture execution context
-    execution_log_id = log_execution(__file__)
+    execution_log_id = None if dry_run else log_execution(__file__)
     
     df_surgery = df_surgery[1:] # skip explanation row
     subject_ids = df_surgery['Mouse ID'].tolist()
@@ -139,6 +204,8 @@ def ingest_behavior_sessions(dj):
     df_wr_all = df_wr_all[df_wr_all['Training type'].apply(_is_valid_training_type)]
 
     for subject_id in subject_ids:
+        if only is not None and subject_id not in {s for s, _ in only}:
+            continue
         session_rows = []
         if 'NDNF behavior notes_{}.csv'.format(subject_id) in metadata_files:
             df_subject = pd.read_csv(dj.config['path.metadata']+'NDNF behavior notes_{}.csv'.format(subject_id))
@@ -191,12 +258,15 @@ def ingest_behavior_sessions(dj):
             experimenter = session_row['experimenter']
             behavior_folder = os.path.join(dj.config['path.raw_data'],'behavior', rig,subject_id)
             session_date = session_row['session_date']
+            if only is not None and (subject_id, session_date) not in only:
+                continue
             if not os.path.exists(behavior_folder):
                 print('no behavior folder found for subject {}, skipping'.format(subject_id))
                 continue
             session_folders_ = np.sort(os.listdir(behavior_folder))
             session_folder_dates = []
             session_folder_times = []
+            session_folder_datetimes = []
             session_folders = []
             session_data_versions = []
             for session_folder in session_folders_:
@@ -238,6 +308,7 @@ def ingest_behavior_sessions(dj):
                     session_folder_time = session_datetime.time()
                     session_folder_dates.append(session_folder_date)
                     session_folder_times.append(session_folder_time)
+                    session_folder_datetimes.append(session_datetime)
                     session_folders.append(session_folder)
                     session_data_versions.append(data_version)
             session_folder_dates = np.array(session_folder_dates)
@@ -250,7 +321,9 @@ def ingest_behavior_sessions(dj):
             except:
                 print('no session found for subject {}'.format(subject_id))
                 continue
-            matching_sessions = experiment.Session()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}  
+            matching_sessions = experiment.Session()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}
+            if len(matching_sessions)==0 and dry_run:
+                continue
             if len(matching_sessions)==0:
                 session_id = len(experiment.Session()&{'subject_id':subject_id})
                 session_dict = {'subject_id': subject_id,
@@ -284,7 +357,7 @@ def ingest_behavior_sessions(dj):
             else:
                 session_dict = (experiment.Session()&{'subject_id':subject_id,'session_date':session_date,'session_time':session_time}  ).fetch1()
             matching_trials = experiment.SessionTrial()&session_dict
-            if len(matching_trials)>0:
+            if len(matching_trials)>0 and not dry_run:
                 print('trials already ingested for session {}, skipping'.format(session_dict))
                 continue
             #if _is_habituation_training_type(session_row.get('training_type')):
@@ -434,9 +507,11 @@ def ingest_behavior_sessions(dj):
                 frame_bin = os.path.join(session_dir, 'behavior', 'Behavior.harp', 'Behavior_92.bin')
                 if os.path.exists(frame_bin) and cameras:
                     raw_frametimes = harp.read(frame_bin).index.values
-                    for camera_name in cameras:
+                    for camera_folder in cameras:
+                        # some rig configs used a different name for the same physical camera
+                        camera_name = _CAMERA_ALIASES.get(rig, {}).get(camera_folder, camera_folder)
                         video_recording_cameras.add((rig, camera_name))
-                        video_dir = os.path.join(session_dir, 'behavior-videos', camera_name)
+                        video_dir = os.path.join(session_dir, 'behavior-videos', camera_folder)
                         video_path = None
                         for fname in ['video.mkv', 'video.avi']:
                             cand = os.path.join(video_dir, fname)
@@ -466,6 +541,7 @@ def ingest_behavior_sessions(dj):
                     idx = entry['data']['LoadCellIndex']
                     if idx < len(p_to_g):
                         lc_baseline_per_axis[idx] = entry['data']['Baseline']
+                rig_slopes = _rig_slopes(data_dict, rig_output_dict)
 
                 for pi,p in enumerate(p_to_g):
                     loadcell_data[pi] = np.polyval(p,loadcell_data[pi])
@@ -572,15 +648,6 @@ def ingest_behavior_sessions(dj):
                         current_block_has_cue = block_params['has_cue']
                         valve_open_time = block_params['valve_open_time']
 
-                        loadcell_limits_dict = {}
-                        for pi,p in enumerate(p_to_g):
-                            if pi not in block_params['loadcell_limits_dict_'].keys():
-                                print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
-                                continue
-                            # action_min/max are baseline-relative raw units; use slope only
-                            # (full polyval would add the intercept, shifting the axis extents)
-                            loadcell_limits_dict[pi] = p[0] * np.array(block_params['loadcell_limits_dict_'][pi])
-
                         distance = np.diff(block_params['start_end_mm'])[0]
                         forcemap_file = os.path.join(session_dir,"behavior/OperationControl/{}.tiff".format(block_params['lut_reference_name']))
 
@@ -589,10 +656,27 @@ def ingest_behavior_sessions(dj):
                         forcemap_im = forcemap_im/block_params['cached_threshold']
                         forcemap_im = forcemap_im#*distance # TODO make sure this is in mm/s!!!
 
+                        # action_min/max are baseline-relative raw units; use slope only
+                        # (full polyval would add the intercept, shifting the axis extents)
+                        if data_version == 'v1':
+                            force_axes = {}
+                            for pi,p in enumerate(p_to_g):
+                                if pi not in block_params['loadcell_limits_dict_'].keys():
+                                    print('no limits found for loadcell {} in session {}'.format(pi,session_dict))
+                                    continue
+                                limits = p[0] * np.array(block_params['loadcell_limits_dict_'][pi])
+                                force_axes[pi] = np.linspace(limits[0], limits[1], forcemap_im.shape[pi])
+                        else:
+                            # stored so that LUT dim d is load-cell channel d, like the force traces
+                            lut_row_action = _lut_row_action(session_folder, session_folder_datetimes[mi], forcemap_im)
+                            forcemap_im, force_axes = _lut_in_channel_space(
+                                forcemap_im, block_params['loadcell_limits_dict_'], block_params['action_channel'],
+                                lut_row_action, p_to_g, rig_slopes)
+
                         # the same normalized LUT image can be reused across blocks with a different
                         # physical axis calibration (e.g. rescaled from +-3000 to +-6000), so the axis
                         # limits must be part of the dedup key too, not just the LUT pixels
-                        axis_limits_key = {dim: tuple(float(v) for v in loadcell_limits_dict[dim]) for dim in loadcell_limits_dict}
+                        axis_limits_key = {dim: (float(force_axes[dim][0]), float(force_axes[dim][-1])) for dim in force_axes}
 
                         task_settings_dict = None
                         add_task_parts = False
@@ -623,7 +707,7 @@ def ingest_behavior_sessions(dj):
                                                         'session':session_dict['session'],
                                                         'task_setting_id':task_settings_dict['task_setting_id'],
                                                         'force_axis_idx': dim,
-                                                        'target_force_axes': np.linspace(loadcell_limits_dict[dim][0],loadcell_limits_dict[dim][1],forcemap_im.shape[dim]), # TODO somehow the last limits of the session override the first ones
+                                                        'target_force_axes': force_axes[dim],
                                                         'force_direction': calibration_dict[dim]['direction'],
                                                         }
                                 task_setting_dict_part_list.append(task_setting_dict_part)
@@ -797,13 +881,19 @@ def ingest_behavior_sessions(dj):
 
 
                     
-                if trial_i >0:
-                    trials_so_far += trial_i+1 # for multiple files in a given session
+                trials_so_far += len(data_dict['Trial']) # for multiple files in a given session (also correct for 0- or 1-trial files)
                 _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
                                  current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
                 if sessiontrial_dict_list:
                     previous_file_last_end_time = sessiontrial_dict_list[-1]['trial_end_time']
             #% finally, do the insertion
+            if dry_run:
+                dry_run_results[(subject_id, session_dict['session'])] = {
+                    'task_settings': task_settings_dict_list,
+                    'force_axes': task_setting_dict_part_list,
+                    'blocks': block_dict_list,
+                }
+                continue
             with dj.conn().transaction:
                 print('uploading session {}'.format(session_dict))
                 experiment.TaskSettings().insert(task_settings_dict_list)
@@ -827,5 +917,7 @@ def ingest_behavior_sessions(dj):
                             {**vf_key, 'frame_times': raw_ft + vf_block_time_offset - session_zero_time},
                             skip_duplicates=True)
                 dj.conn().ping()
+    if dry_run:
+        return dry_run_results
                 
 
