@@ -13,8 +13,20 @@ for metadata_spreadsheet in dj.config['metadata.spreadsheet_names']:
 from ndnf_pipeline.ingest.ingest_metadata import ingest_metadata
 from ndnf_pipeline.ingest.ingest_behavior import ingest_behavior_sessions
 from ndnf_pipeline import behavior_analysis,videography
-
+#%%
 ingest_metadata(dj)    
 ingest_behavior_sessions(dj)
+#%%
 behavior_analysis.BlockStatistics.populate()
-videography.TrialVideo().populate(display_progress=True, reserve_jobs=True)
+#videography.TrialVideo().populate(display_progress=True, reserve_jobs=True)
+behavior_analysis.BlockStatistics.populate(display_progress=True, suppress_errors=True)
+behavior_analysis.TrialSaturationTimes.populate(display_progress=True, suppress_errors=True)
+
+behavior_analysis.TrialTouchTimes.populate(display_progress=True, suppress_errors=True)
+behavior_analysis.TrialTiming.populate(display_progress=True, suppress_errors=True)
+behavior_analysis.BlockTiming.populate(display_progress=True, suppress_errors=True)
+#%%
+behavior_analysis.schema.drop()
+
+#%%
+behavior_analysis.TrialTouchTimes.populate(display_progress=True, suppress_errors=True)
