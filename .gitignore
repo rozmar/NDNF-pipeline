@@ -17,6 +17,7 @@ dj_local_conf.json
 google_creds.json
 *.pem
 *.key
+*.csv
 
 # GUI config: remembers a machine-local dj_local_conf.json path, not portable
 GUIs/gui_config.json
@@ -32,3 +33,4 @@ Thumbs.db
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
+
