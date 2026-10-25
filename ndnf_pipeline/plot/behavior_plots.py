@@ -623,13 +623,14 @@ def plot_session_blocks_overview(subject_id, session,
     block_data = []
     session_info = []
     trial_offset = 0
+    empty_sessions = []
     for sess in sessions:
         available_blocks = np.sort((experiment.Block() & {'subject_id': subject_id, 'session': sess}).fetch('block'))
         if len(available_blocks) == 0:
-            # fail with a clear, actionable message here rather than a bare "min() iterable
-            # argument is empty" once block_data (populated below) turns out empty - e.g. a
-            # session that's been created but has no completed blocks logged yet
-            raise RuntimeError(f"No blocks found for {subject_id} session {sess}.")
+            # e.g. a session that's been created but has no completed blocks logged yet (still
+            # running / not fully ingested) - skip it rather than failing the whole plot
+            empty_sessions.append(sess)
+            continue
         session_date, session_time = (experiment.Session() & {'subject_id': subject_id, 'session': sess}).fetch1('session_date', 'session_time')
 
         session_min_trial = None
@@ -682,6 +683,15 @@ def plot_session_blocks_overview(subject_id, session,
                                   offset=trial_offset, min_trial=session_min_trial, max_trial=session_max_trial))
         if session_min_trial is not None:
             trial_offset += (session_max_trial - session_min_trial + 1) + GAP
+
+    if not block_data:
+        # fail with a clear, actionable message here rather than a bare "min() iterable
+        # argument is empty" further down
+        raise RuntimeError(f"No blocks found for {subject_id} session(s) {', '.join(map(str, empty_sessions))}.")
+    if empty_sessions:
+        print(f"Skipping {subject_id} session(s) {', '.join(map(str, empty_sessions))}: no blocks found.")
+    sessions = [s for s in sessions if s not in empty_sessions]
+    multi_session = len(sessions) > 1
 
     n_blocks = len(block_data)
     block_colors = plt.cm.tab10(np.arange(max(n_blocks, 1)) % 10)
