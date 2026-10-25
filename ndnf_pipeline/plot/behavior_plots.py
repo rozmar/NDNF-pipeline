@@ -154,21 +154,26 @@ def _force_histogram(lr_traces, pa_traces, histrange, bins=50):
 
 
 def _pad_lut_to_range(lut, lut_extent, target_range):
-    """Edge-pad lut.T to cover target_range by replicating border pixels outward.
+    """Edge-pad lut.T outward (replicating border pixels) so it covers at least target_range.
 
-    lut is [LR, PA] (dim0=LR, dim1=PA); returns a (PA+pad, LR+pad) array ready
-    for imshow with origin='lower' and extent=target_range.
+    lut is [LR, PA] (dim0=LR, dim1=PA); returns (array, extent): a (PA+pad, LR+pad) array
+    and the extent it actually spans, for imshow with origin='lower'. Never crops - when
+    target_range is inside the LUT the caller's set_xlim/set_ylim does the zooming, which
+    only works if imshow gets the array's real extent rather than target_range.
     """
     lr_min, lr_max, pa_min, pa_max = lut_extent
     u_lr_min, u_lr_max, u_pa_min, u_pa_max = target_range
     n_lr, n_pa = lut.shape
     dlr = (lr_max - lr_min) / max(n_lr - 1, 1)
     dpa = (pa_max - pa_min) / max(n_pa - 1, 1)
-    pad_left  = max(0, int(round((lr_min  - u_lr_min) / dlr)))
-    pad_right = max(0, int(round((u_lr_max - lr_max)  / dlr)))
-    pad_bot   = max(0, int(round((pa_min  - u_pa_min) / dpa)))
-    pad_top   = max(0, int(round((u_pa_max - pa_max)  / dpa)))
-    return np.pad(lut.T, ((pad_bot, pad_top), (pad_left, pad_right)), mode='edge')
+    pad_left  = max(0, int(np.ceil((lr_min  - u_lr_min) / dlr)))
+    pad_right = max(0, int(np.ceil((u_lr_max - lr_max)  / dlr)))
+    pad_bot   = max(0, int(np.ceil((pa_min  - u_pa_min) / dpa)))
+    pad_top   = max(0, int(np.ceil((u_pa_max - pa_max)  / dpa)))
+    padded = np.pad(lut.T, ((pad_bot, pad_top), (pad_left, pad_right)), mode='edge')
+    extent = [lr_min - pad_left * dlr, lr_max + pad_right * dlr,
+              pa_min - pad_bot * dpa, pa_max + pad_top * dpa]
+    return padded, extent
 
 
 def _plot_force_trajectories(ax, lr_traces, pa_traces, force_uniform_range=True, uniform_force_range=None,
@@ -396,8 +401,7 @@ def plot_block_force_figure(subject_id, session, block,
 
     lut_vmin, lut_vmax = np.min(lut), np.max(lut)
     if force_uniform_range:
-        lut_disp = _pad_lut_to_range(lut, lut_extent, uniform_force_range)
-        disp_extent = uniform_force_range
+        lut_disp, disp_extent = _pad_lut_to_range(lut, lut_extent, uniform_force_range)
     else:
         lut_disp = lut.T
         disp_extent = lut_extent
@@ -751,8 +755,7 @@ def plot_session_blocks_overview(subject_id, session,
     for bi, (bd, color) in enumerate(zip(block_data, block_colors)):
         ax_lut = fig.add_subplot(gs[1, bi])
         if force_uniform_range:
-            lut_disp = _pad_lut_to_range(bd['lut'], bd['lut_extent'], uniform_force_range)
-            lut_disp_extent = uniform_force_range
+            lut_disp, lut_disp_extent = _pad_lut_to_range(bd['lut'], bd['lut_extent'], uniform_force_range)
         else:
             lut_disp = bd['lut'].T
             lut_disp_extent = bd['lut_extent']

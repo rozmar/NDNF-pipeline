@@ -415,8 +415,8 @@ class _VideoFrameArtists:
         lut_extent = data['lut_extent']
         uniform_extent = [-force_axis_limit, force_axis_limit, -force_axis_limit, force_axis_limit]
         vmin, vmax = np.min(target_force_lut), np.max(target_force_lut)
-        lut_disp = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
-        ax_target.imshow(lut_disp, extent=uniform_extent, origin='lower',
+        lut_disp, lut_disp_extent = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
+        ax_target.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
                           cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
         ax_target.set_xlim([-force_axis_limit, force_axis_limit])
         ax_target.set_ylim([-force_axis_limit, force_axis_limit])
@@ -428,7 +428,7 @@ class _VideoFrameArtists:
         # trajectory can be read against the target without glancing over to the separate Target
         # panel; drawn before the trajectory artists below so it stays behind them, and kept
         # translucent (lut_alpha) so it doesn't drown out the black/gray trajectory on top of it ---
-        self.ax_current.imshow(lut_disp, extent=uniform_extent, origin='lower',
+        self.ax_current.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
                                 cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax, alpha=lut_alpha)
 
         # --- dynamic: force trajectory (placeholder artists now, real data via update() below) ---
