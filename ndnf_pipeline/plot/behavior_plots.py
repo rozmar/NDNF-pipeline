@@ -202,6 +202,20 @@ def _plot_force_trajectories(ax, lr_traces, pa_traces, force_uniform_range=True,
     return ax
 
 
+def _keep_trials(trials, trial_nums, *columns):
+    """(trial_nums, *columns) - rows of a fetch - cut down to the trial numbers in `trials`,
+    or unchanged if trials is empty/None.
+
+    Trial selections are applied here, after fetching every trial of the block, rather than
+    as an SQL restriction: that keeps the query (and so its key in the GUIs' query cache and
+    downloaded sessions, see GUIs/dj_connection.py) the same whichever trials are picked.
+    """
+    if not trials:
+        return (trial_nums, *columns)
+    keep = np.isin(np.asarray(trial_nums, dtype=np.int64), [int(t) for t in trials])
+    return (trial_nums[keep], *(column[keep] for column in columns))
+
+
 def _fetch_quiescence_response(experiment, key):
     """Per-trial quiescence and response durations for a subject/session/block key.
 
@@ -427,13 +441,9 @@ def plot_block_force_figure(subject_id, session, block,
                              * experiment.BehaviorTrial() * experiment.Block() & {**key, 'force_axis_idx': 0})
     force_traces_1_query = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
                              & {**key, 'force_axis_idx': 1})
-    if trials:
-        trial_restriction = [{'trial': int(t)} for t in trials]
-        force_traces_0_query = force_traces_0_query & trial_restriction
-        force_traces_1_query = force_traces_1_query & trial_restriction
-    force_trials, force_trace_times, force_traces_0_ = force_traces_0_query.fetch(
-        'trial', 'force_trace_time', 'force_trace_value', order_by='trial')
-    _, force_traces_1_ = force_traces_1_query.fetch('trial', 'force_trace_value', order_by='trial')
+    force_trials, force_trace_times, force_traces_0_ = _keep_trials(trials, *force_traces_0_query.fetch(
+        'trial', 'force_trace_time', 'force_trace_value', order_by='trial'))
+    _, force_traces_1_ = _keep_trials(trials, *force_traces_1_query.fetch('trial', 'force_trace_value', order_by='trial'))
     f0_baseline = np.median(np.concatenate(force_traces_0_))
     f1_baseline = np.median(np.concatenate(force_traces_1_))
     force_traces_0 = [f - f0_baseline for f in force_traces_0_]
@@ -465,12 +475,13 @@ def plot_block_force_figure(subject_id, session, block,
     # --- shared per-trial timing, used by both the lickport and force-vs-time panels below ---
     time_query = (experiment.TrialForceTrace() * experiment.BehaviorTrial() * experiment.Block()
                   * experiment.SessionTrial() & key)
-    if trials:
-        time_query = time_query & trial_restriction
-    time_trials, trial_starts, trial_ends, force_times = time_query.fetch(
-        'trial', 'trial_start_time', 'trial_end_time', 'force_trace_time', order_by='trial')
+    # force_trace_time is already in hand from the force fetch above (same trials, same order - checked
+    # below), so only the trial timing is fetched here rather than downloading that blob a second time
+    time_trials, trial_starts, trial_ends = _keep_trials(trials, *time_query.fetch(
+        'trial', 'trial_start_time', 'trial_end_time', order_by='trial'))
     if not np.array_equal(time_trials, force_trials):
         raise RuntimeError('trial mismatch between TrialForceTrace and TrialForceTrace.TrialForceAxis fetches')
+    force_times = force_trace_times
     trial_start_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_starts, float)))
     trial_end_by_num = dict(zip(time_trials.tolist(), np.asarray(trial_ends, float)))
 
@@ -495,10 +506,8 @@ def plot_block_force_figure(subject_id, session, block,
     ax_lickport = fig.add_subplot(gs[2, :], sharex=ax_force_time)
     lickport_query = (experiment.TrialRewardPortPosition() * experiment.BehaviorTrial() * experiment.Block()
                        * experiment.SessionTrial() & key)
-    if trials:
-        lickport_query = lickport_query & trial_restriction
-    lp_trials, lp_trial_starts, lp_times, lp_values = lickport_query.fetch(
-        'trial', 'trial_start_time', 'reward_port_position_time', 'reward_port_position_values', order_by='trial')
+    lp_trials, lp_trial_starts, lp_times, lp_values = _keep_trials(trials, *lickport_query.fetch(
+        'trial', 'trial_start_time', 'reward_port_position_time', 'reward_port_position_values', order_by='trial'))
     lickport_carry = None  # last known lickport position, carried across the trial-to-trial gap
     for trial, trial_start, lp_time, lp_val in zip(lp_trials, np.asarray(lp_trial_starts, float), lp_times, lp_values):
         trial = int(trial)
@@ -524,9 +533,7 @@ def plot_block_force_figure(subject_id, session, block,
 
     lick_query = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
                   & {**key, 'trial_event_type': 'lick'})
-    if trials:
-        lick_query = lick_query & trial_restriction
-    lick_trials_raw, lick_times_raw = lick_query.fetch('trial', 'trial_event_time')
+    lick_trials_raw, lick_times_raw = _keep_trials(trials, *lick_query.fetch('trial', 'trial_event_time'))
     lick_abs_times = [trial_start_by_num[int(t)] + float(lt) for t, lt in zip(lick_trials_raw, lick_times_raw)
                        if int(t) in trial_start_by_num]
     if lick_abs_times:
@@ -566,6 +573,312 @@ def plot_block_force_figure(subject_id, session, block,
     if fig_dir is not None:
         os.makedirs(fig_dir, exist_ok=True)
         fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_b{block}.png'), dpi=150)
+
+    return fig
+
+
+def plot_session_force_figure(subject_id, session,
+                               force_uniform_range=True, uniform_force_range=None,
+                               perf_log_yscale=False, perf_smoothing_window=10,
+                               trials=None, epochs=None,
+                               filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
+                               filter_polyorder=3, fig_dir=None):
+    """6-panel figure across every block of one session: target LUT(s), performance, force
+    distribution, force trajectories (spatial), lickport position vs. time, and force vs. time.
+
+    Unlike plot_session_blocks_overview (one column of panels per block, side by side), this
+    lays every block's trials out on one continuous trial-number/session-time axis - like
+    plot_block_force_figure, but for the whole session instead of one block - so a `trials`
+    restriction can span a block boundary (e.g. the last few trials of one block through the
+    first few of the next).
+
+    X is always Left-Right (L<0, R>0) and Y is always Posterior-Anterior (P<0, A>0),
+    regardless of which raw loadcell axis/direction the rig recorded.
+
+    The performance panel (quiescence/response duration per trial) always covers every trial of
+    the session, block-shaded and color-coded (matching plot_session_blocks_overview's row 1).
+    If trials is given, the force distribution, spatial trajectory, lickport, and force-vs-time
+    panels are restricted to just those trial numbers (and the target LUT panel to just the
+    block(s) they belong to); otherwise every trial/block of the session is used. Each trial is
+    plotted against its own block's LR/PA sign convention, so a selection spanning blocks stays
+    correct even where the rig's axis mapping differs between them.
+
+    epochs restricts the force distribution, spatial trajectory, and force-vs-time panels
+    to samples falling within the given trial epoch(s): any subset of ('quiescence',
+    'response', 'reward'). None (or a set covering all three) means no restriction.
+
+    filter_method smooths each trial's force trace (per-trial, before the epoch restriction
+    above) with one of FILTER_METHODS: None/'none' (no filtering), 'boxcar' (moving average,
+    `filter_window_ms`), 'median' (`filter_window_ms`), 'gaussian' (`filter_sigma_ms`), or
+    'savgol' (Savitzky-Golay polynomial fit, `filter_window_ms` and `filter_polyorder`).
+    `filter_window_ms`/`filter_sigma_ms` are converted to samples using each block's own force
+    trace sample interval. Filtering feeds every downstream panel that uses the force traces
+    (distribution, trajectory, force-vs-time).
+
+    If fig_dir is given, saves to '{fig_dir}/{subject_id}_s{session}_all_blocks.png'.
+    Returns the figure.
+    """
+    from ndnf_pipeline import experiment
+
+    if uniform_force_range is None:
+        uniform_force_range = DEFAULT_UNIFORM_FORCE_RANGE
+
+    key = {'subject_id': subject_id, 'session': session}
+    session_date, session_time = (experiment.Session() & key).fetch1('session_date', 'session_time')
+    blocks = sorted((experiment.Block() & key).fetch('block').tolist())
+    if not blocks:
+        raise RuntimeError(f"No blocks found for {subject_id} session {session}.")
+    block_colors = dict(zip(blocks, plt.cm.tab10(np.arange(len(blocks)) % 10)))
+
+    # --- per-block LUT + force-axis normalization (may differ block to block) ---
+    block_info = {}
+    for block in blocks:
+        bkey = {**key, 'block': block}
+        task_setting_id, target_force_lut, feedback_type = (
+            experiment.TaskSettings() * experiment.Block() & bkey).fetch1(
+            'task_setting_id', 'target_force_lut', 'feedback_type')
+        force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(
+            experiment, subject_id, session, task_setting_id)
+        lut, lut_extent, lr_extent, pa_extent = _normalize_lut(
+            target_force_lut, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+        block_info[block] = dict(lr_idx=lr_idx, pa_idx=pa_idx, lr_sign=lr_sign, pa_sign=pa_sign,
+                                  lut=lut, lut_extent=lut_extent, lr_extent=lr_extent, pa_extent=pa_extent,
+                                  feedback_type=feedback_type)
+
+    trial_nums_all, trial_blocks_all = (experiment.BehaviorTrial() & key).fetch('trial', 'block')
+    block_by_trial = dict(zip(trial_nums_all.tolist(), trial_blocks_all.tolist()))
+
+    # period boundaries for every trial in the session (see plot_block_force_figure's equivalent) -
+    # one joint fetch, not two separate ones, so trial/start/end stay row-aligned regardless of
+    # fetch ordering (SessionTrial may include trials BehaviorTrial doesn't, e.g. discarded ones)
+    go_by_trial = _event_time_by_trial(experiment, key, 'go')
+    threshold_by_trial = _event_time_by_trial(experiment, key, 'threshold crossing')
+    reward_by_trial = _event_time_by_trial(experiment, key, 'reward')
+    epoch_trial_nums, epoch_trial_starts, epoch_trial_ends = (
+        experiment.SessionTrial() * experiment.BehaviorTrial() & key
+    ).fetch('trial', 'trial_start_time', 'trial_end_time')
+    epoch_windows = _epoch_windows_from_events(go_by_trial, threshold_by_trial, reward_by_trial,
+                                                epoch_trial_nums, epoch_trial_starts, epoch_trial_ends)
+
+    if trials:
+        blocks_shown = sorted({block_by_trial[int(t)] for t in trials if int(t) in block_by_trial})
+        if not blocks_shown:
+            raise RuntimeError(f"None of the given trials belong to {subject_id} session {session}.")
+    else:
+        blocks_shown = blocks
+
+    fig = plt.figure(figsize=(12, 19))
+    gs = plt.GridSpec(4, 2, figure=fig, height_ratios=[1, 1, 0.6, 0.8], hspace=0.45, wspace=0.3)
+
+    # --- target LUT(s): one column per block actually represented in the trial selection ---
+    lut_vmin = min(np.min(block_info[b]['lut']) for b in blocks_shown)
+    lut_vmax = max(np.max(block_info[b]['lut']) for b in blocks_shown)
+    inner_lut = gs[0, 0].subgridspec(1, len(blocks_shown), wspace=0.15)
+    axes_lut, im_lut = [], None
+    for bi, block in enumerate(blocks_shown):
+        bd = block_info[block]
+        ax_lut = fig.add_subplot(inner_lut[0, bi])
+        if force_uniform_range:
+            lut_disp, disp_extent = _pad_lut_to_range(bd['lut'], bd['lut_extent'], uniform_force_range)
+        else:
+            lut_disp = bd['lut'].T
+            disp_extent = bd['lut_extent']
+        im_lut = ax_lut.imshow(lut_disp, extent=disp_extent, origin='lower', cmap='viridis',
+                                aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
+        if force_uniform_range:
+            ax_lut.set_xlim(uniform_force_range[:2])
+            ax_lut.set_ylim(uniform_force_range[2:])
+        ax_lut.set_title(f"b{block}: {bd['feedback_type']}", fontsize=8, color=block_colors[block])
+        if bi == 0:
+            ax_lut.set_xlabel('Left - Right (g)', fontsize=7)
+            ax_lut.set_ylabel('Posterior - Anterior (g)', fontsize=7)
+        else:
+            ax_lut.set_yticklabels([])
+        ax_lut.tick_params(labelsize=6)
+        axes_lut.append(ax_lut)
+    if im_lut is not None:
+        fig.colorbar(im_lut, ax=axes_lut, label='reward port speed', fraction=0.046, pad=0.04)
+
+    # --- performance: every trial of the session, each block shaded/color-coded ---
+    ax_performance = fig.add_subplot(gs[1, 0])
+    for block in blocks:
+        color = block_colors[block]
+        block_trial_nums = np.array([t for t, b in block_by_trial.items() if b == block])
+        if len(block_trial_nums):
+            ax_performance.axvspan(block_trial_nums.min() - 0.5, block_trial_nums.max() + 0.5,
+                                    color=color, alpha=0.12)
+        perf_trials, quiescence_value, response_value = _fetch_quiescence_response(experiment, {**key, 'block': block})
+        _plot_quiescence_response(ax_performance, perf_trials, quiescence_value, response_value,
+                                   color=color, smoothing_window=perf_smoothing_window,
+                                   log_yscale=perf_log_yscale)
+    ax_performance.set_title(f'{subject_id} s{session}  {session_date} {session_time}')
+    _add_quiescence_response_marker_legend(ax_performance, perf_smoothing_window, bbox_to_anchor=(1.0, -0.2))
+
+    # --- gather force/lickport/lick data across every block shown, restricted to `trials` if
+    # given - each block queried separately since its own LR/PA sign convention and per-block
+    # sample interval (for filter_window_ms/filter_sigma_ms) may differ from the next ---
+    force_trials, lr_traces, pa_traces = [], [], []
+    time_trials, trial_starts_l, trial_ends_l, force_times = [], [], [], []
+    lp_trials, lp_trial_starts, lp_times, lp_values = [], [], [], []
+    lick_trials_raw, lick_times_raw = [], []
+
+    for block in blocks_shown:
+        bkey = {**key, 'block': block}
+        bd = block_info[block]
+
+        force_traces_0_query = (experiment.TrialForceTrace() * experiment.TrialForceTrace.TrialForceAxis()
+                                 * experiment.BehaviorTrial() * experiment.Block() & {**bkey, 'force_axis_idx': 0})
+        force_traces_1_query = (experiment.TrialForceTrace.TrialForceAxis() * experiment.BehaviorTrial() * experiment.Block()
+                                 & {**bkey, 'force_axis_idx': 1})
+        b_trials, b_times, b_f0_ = _keep_trials(trials, *force_traces_0_query.fetch(
+            'trial', 'force_trace_time', 'force_trace_value', order_by='trial'))
+        if len(b_trials) == 0:
+            continue
+        _, b_f1_ = _keep_trials(trials, *force_traces_1_query.fetch('trial', 'force_trace_value', order_by='trial'))
+        f0_baseline = np.median(np.concatenate(b_f0_))
+        f1_baseline = np.median(np.concatenate(b_f1_))
+        b_f0 = [f - f0_baseline for f in b_f0_]
+        b_f1 = [f - f1_baseline for f in b_f1_]
+        b_lr, b_pa = _lr_pa_traces(b_f0, b_f1, bd['lr_idx'], bd['pa_idx'], bd['lr_sign'], bd['pa_sign'])
+        sample_interval_s = _estimate_sample_interval(b_times)
+        filter_window = ms_to_samples(filter_window_ms, sample_interval_s, minimum=1)
+        filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
+        b_lr, b_pa = _filter_traces(b_lr, b_pa, filter_method, window=filter_window,
+                                     sigma=filter_sigma, polyorder=filter_polyorder)
+        b_lr, b_pa = _filter_traces_by_epochs(b_trials, b_times, b_lr, b_pa, epoch_windows, epochs)
+        force_trials.extend(int(t) for t in b_trials)
+        lr_traces.extend(b_lr)
+        pa_traces.extend(b_pa)
+
+        time_query = (experiment.TrialForceTrace() * experiment.BehaviorTrial() * experiment.Block()
+                      * experiment.SessionTrial() & bkey)
+        # force_trace_time is already in hand from the force fetch above (same trials, same order - checked
+        # below), so only the trial timing is fetched here rather than downloading that blob a second time
+        b_time_trials, b_trial_starts, b_trial_ends = _keep_trials(trials, *time_query.fetch(
+            'trial', 'trial_start_time', 'trial_end_time', order_by='trial'))
+        if not np.array_equal(b_time_trials, b_trials):
+            raise RuntimeError('trial mismatch between TrialForceTrace and TrialForceTrace.TrialForceAxis fetches')
+        time_trials.extend(int(t) for t in b_time_trials)
+        trial_starts_l.extend(np.asarray(b_trial_starts, float))
+        trial_ends_l.extend(np.asarray(b_trial_ends, float))
+        force_times.extend(b_times)
+
+        lickport_query = (experiment.TrialRewardPortPosition() * experiment.BehaviorTrial() * experiment.Block()
+                           * experiment.SessionTrial() & bkey)
+        b_lp_trials, b_lp_trial_starts, b_lp_times, b_lp_values = _keep_trials(trials, *lickport_query.fetch(
+            'trial', 'trial_start_time', 'reward_port_position_time', 'reward_port_position_values', order_by='trial'))
+        lp_trials.extend(int(t) for t in b_lp_trials)
+        lp_trial_starts.extend(np.asarray(b_lp_trial_starts, float))
+        lp_times.extend(b_lp_times)
+        lp_values.extend(b_lp_values)
+
+        lick_query = (experiment.TrialEvent() * experiment.BehaviorTrial() * experiment.Block()
+                      & {**bkey, 'trial_event_type': 'lick'})
+        b_lick_trials, b_lick_times = _keep_trials(trials, *lick_query.fetch('trial', 'trial_event_time'))
+        lick_trials_raw.extend(b_lick_trials)
+        lick_times_raw.extend(b_lick_times)
+
+    if not force_trials:
+        raise RuntimeError(f"No force trace data for the selected trials in {subject_id} session {session}.")
+    trial_starts_arr = np.asarray(trial_starts_l, float)
+    trial_ends_arr = np.asarray(trial_ends_l, float)
+
+    # --- force distribution + spatial trajectories, merged across every block shown ---
+    ax_force_hist = fig.add_subplot(gs[0, 1])
+    if force_uniform_range:
+        histrange = [uniform_force_range[:2], uniform_force_range[2:]]
+    else:
+        # union of every shown block's own extent, since they can differ block to block
+        lr_extents = [block_info[b]['lr_extent'] for b in blocks_shown]
+        pa_extents = [block_info[b]['pa_extent'] for b in blocks_shown]
+        histrange = [[min(e[0] for e in lr_extents), max(e[1] for e in lr_extents)],
+                     [min(e[0] for e in pa_extents), max(e[1] for e in pa_extents)]]
+    forcehist, binx, biny = _force_histogram(lr_traces, pa_traces, histrange)
+    if forcehist is not None:
+        im_hist = ax_force_hist.imshow(forcehist.T, origin='lower',
+                                        extent=[binx[0], binx[-1], biny[0], biny[-1]],
+                                        aspect='auto', alpha=1)
+        ax_force_hist.set_xlabel('Left - Right (g)')
+        ax_force_hist.set_ylabel('Posterior - Anterior (g)')
+        plt.colorbar(im_hist, ax=ax_force_hist, label='fraction of time spent')
+    ax_force_hist.set_title(f'{len(force_trials)} trials')
+
+    ax_traj = fig.add_subplot(gs[1, 1])
+    _plot_force_trajectories(ax_traj, lr_traces, pa_traces, force_uniform_range, uniform_force_range)
+
+    # --- lickport position vs. time, shares its x axis with the force-vs-time panel below ---
+    trial_start_by_num = dict(zip(time_trials, trial_starts_arr))
+    trial_end_by_num = dict(zip(time_trials, trial_ends_arr))
+
+    def _shade_trial_periods(ax, trial, trial_start, trial_end):
+        go_t = go_by_trial.get(trial)
+        threshold_t = threshold_by_trial.get(trial)
+        reward_t = reward_by_trial.get(trial)
+        if go_t is not None:
+            quiescence_end = trial_start + go_t
+            response_end = trial_start + threshold_t if threshold_t is not None else trial_end
+            ax.axvspan(trial_start, quiescence_end, color='gray', alpha=0.15, linewidth=0)
+            ax.axvspan(quiescence_end, response_end, color='gold', alpha=0.15, linewidth=0)
+        reward_time_abs = trial_start + reward_t if reward_t is not None else (
+            trial_start + threshold_t if threshold_t is not None else None)
+        if reward_time_abs is not None:
+            ax.axvline(reward_time_abs, color='green', linewidth=1.2, alpha=0.8)
+
+    ax_force_time = fig.add_subplot(gs[3, :])
+    ax_lickport = fig.add_subplot(gs[2, :], sharex=ax_force_time)
+    lickport_carry = None  # last known lickport position, carried across the trial-to-trial gap
+    for trial, trial_start, lp_time, lp_val in zip(lp_trials, lp_trial_starts, lp_times, lp_values):
+        trial = int(trial)
+        trial_end = trial_end_by_num.get(trial, trial_start)
+        _shade_trial_periods(ax_lickport, trial, trial_start, trial_end)
+        lp_time_arr = np.asarray(lp_time, float)
+        lp_val_arr = np.asarray(lp_val, float)
+        if len(lp_time_arr) == 0:
+            if lickport_carry is not None:
+                ax_lickport.step([trial_start, trial_end], [lickport_carry, lickport_carry], where='post',
+                                  color='tab:purple', linewidth=0.8, alpha=0.8)
+            continue
+        lead_val = lickport_carry if lickport_carry is not None else lp_val_arr[0]
+        ext_time_abs = np.concatenate([[trial_start], trial_start + lp_time_arr, [trial_end]])
+        ext_val = np.concatenate([[lead_val], lp_val_arr, [lp_val_arr[-1]]])
+        ax_lickport.step(ext_time_abs, ext_val, where='post', color='tab:purple', linewidth=0.8, alpha=0.8)
+        lickport_carry = lp_val_arr[-1]
+
+    lick_abs_times = [trial_start_by_num[int(t)] + float(lt) for t, lt in zip(lick_trials_raw, lick_times_raw)
+                       if int(t) in trial_start_by_num]
+    if lick_abs_times:
+        y0, y1 = ax_lickport.get_ylim()
+        tick_height = 0.08 * (y1 - y0)
+        ax_lickport.eventplot(lick_abs_times, orientation='horizontal', lineoffsets=y1 - tick_height / 2,
+                               linelengths=tick_height, colors='black')
+    ax_lickport.set_ylabel('lickport pos (mm)')
+    plt.setp(ax_lickport.get_xticklabels(), visible=False)  # x axis is shared with the panel below
+
+    for trial, trial_start, trial_end, f_time, lr, pa in zip(
+            time_trials, trial_starts_arr, trial_ends_arr, force_times, lr_traces, pa_traces):
+        _shade_trial_periods(ax_force_time, trial, trial_start, trial_end)
+        abs_time = trial_start + np.asarray(f_time, float)
+        ax_force_time.plot(abs_time, lr, '-', color='tab:blue', linewidth=0.7, alpha=0.7)
+        ax_force_time.plot(abs_time, pa, '-', color='tab:orange', linewidth=0.7, alpha=0.7)
+    if force_uniform_range:
+        ax_force_time.set_ylim(min(uniform_force_range[:2].min(), uniform_force_range[2:].min()),
+                                max(uniform_force_range[:2].max(), uniform_force_range[2:].max()))
+    ax_force_time.set_xlabel('session time (s)')
+    ax_force_time.set_ylabel('force (g)')
+    fig.subplots_adjust(bottom=0.08)
+    ax_force_time.legend(handles=[
+        Line2D([0], [0], color='tab:blue', label='Left - Right'),
+        Line2D([0], [0], color='tab:orange', label='Posterior - Anterior'),
+        Line2D([0], [0], color='tab:purple', label='lickport pos'),
+        Line2D([0], [0], color='black', marker='|', linestyle='None', markersize=8, label='licks'),
+        Patch(color='gray', alpha=0.3, label='quiescence'),
+        Patch(color='gold', alpha=0.3, label='response'),
+        Line2D([0], [0], color='green', label='reward'),
+    ], loc='upper center', bbox_to_anchor=(0.5, -0.15), fontsize=8, ncol=7)
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(os.path.join(fig_dir, f'{subject_id}_s{session}_all_blocks.png'), dpi=150)
 
     return fig
 
@@ -619,8 +932,9 @@ def plot_session_blocks_overview(subject_id, session,
         raise RuntimeError("No sessions given.")
     multi_session = len(sessions) > 1
 
-    # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax, and
-    # row 1 can lay every session's trials out on one shared x-axis. session_info accumulates,
+    # --- gather everything needed per block up front, so rows 2 and 3 can share vmin/vmax
+    # (LUT and histogram), and row 1 can lay every session's trials out on one shared
+    # x-axis. session_info accumulates,
     # per session, the trial-number offset (see GAP below) that row 1 shifts that session's
     # trials by, plus its own min/max raw trial number and date/time (for the boundary label).
     GAP = 2  # spacing (in trial-number units) left between consecutive sessions' spans on row 1
@@ -707,7 +1021,7 @@ def plot_session_blocks_overview(subject_id, session,
     hist_vmin = min(np.min(h) for h in hist_vals) if hist_vals else None
     hist_vmax = max(np.max(h) for h in hist_vals) if hist_vals else None
 
-    fig = plt.figure(figsize=(4 * max(n_blocks, 1), 13))
+    fig = plt.figure(figsize=(4 * max(n_blocks, 1), 13.5))
     gs = plt.GridSpec(4, max(n_blocks, 1), figure=fig, height_ratios=[1, 1.1, 1.1, 1.1], hspace=0.5, wspace=0.3)
 
     # --- row 1: quiescence & response durations, blocks highlighted. With multiple sessions,
@@ -732,17 +1046,18 @@ def plot_session_blocks_overview(subject_id, session,
             mid = si['offset'] + (si['max_trial'] - si['min_trial']) / 2
             # placed just below the (tick-less, in the multi-session case) x-axis rather than
             # above the plot, so it never collides with the title or with data near the top
-            ax_perf.text(mid, -0.04, f"s{si['session']}  {si['session_date']}", transform=ax_perf.get_xaxis_transform(),
-                         ha='center', va='top', fontsize=8)
-        ax_perf.set_title(f"{subject_id}  ({', '.join(f's{si['session']}' for si in session_info)})")
-    else:
-        si = session_info[0]
-        ax_perf.set_title(f"{subject_id} s{si['session']}  {si['session_date']} {si['session_time']}")
+            ax_perf.text(mid, -0.04, f"s{si['session']}  {si['session_date']}",
+                          transform=ax_perf.get_xaxis_transform(),
+                          ha='center', va='top', fontsize=8)
+        ax_perf.set_xticks([])
     ax_perf.set_xlabel('trial#' if not multi_session else '')
     if multi_session:
-        ax_perf.set_xticks([])
+        ax_perf.set_title(f"{subject_id}  ({', '.join(f's{si['session']}' for si in session_info)})")
+    else:
+        si0 = session_info[0]
+        ax_perf.set_title(f"{subject_id} s{si0['session']}  {si0['session_date']} {si0['session_time']}")
     # shrink row 1's own axes and put the marker legend in the freed-up strip to its right,
-    # so it never sits on top of the data (or of row 2 below it)
+    # so it never sits on top of the data
     pos = ax_perf.get_position()
     legend_width = 0.15
     ax_perf.set_position([pos.x0, pos.y0, pos.width - legend_width, pos.height])
@@ -891,45 +1206,160 @@ def plot_trials_per_mouse(lab, experiment, subject_ids=None, fig_dir=None):
     return fig
 
 
-def _fetch_session_trend(experiment, subject_id):
-    """Per-session (trial count, session length, hit rate) arrays for one subject, sorted by session."""
+def _fetch_session_trend(experiment, subject_id, sessions=None):
+    """Per-session (date, trial count, session duration, reward count, success rate) arrays
+    for one subject, sorted by session.
+
+    duration is in minutes (session length, from session start to the last trial's end);
+    success_rate is hit trials / total trials as a percentage (0-100); reward_count is the
+    number of 'reward' TrialEvents delivered that session.
+
+    sessions restricts the result to just those session ids (e.g. the ones currently
+    selected in the GUI); None (the default) uses every session the subject has.
+    """
     available_sessions = np.sort((experiment.Session() & {'subject_id': subject_id}).fetch('session'))
-    trial_nums, hit_rates, session_lengths = [], [], []
+    if sessions:
+        wanted = set(int(s) for s in sessions)
+        available_sessions = np.array([s for s in available_sessions if int(s) in wanted])
+    dates, trial_nums, durations, reward_counts, success_rates = [], [], [], [], []
     for session in available_sessions:
-        trials = (experiment.SessionTrial() & {'subject_id': subject_id, 'session': session}).fetch('trial')
+        skey = {'subject_id': subject_id, 'session': int(session)}
+        trials = (experiment.SessionTrial() & skey).fetch('trial')
         trial_nums.append(len(trials))
-        hits = len(experiment.BehaviorTrial() & {'subject_id': subject_id, 'session': session, 'outcome': 'hit'})
-        hit_rates.append(hits / len(trials) if len(trials) > 0 else np.nan)
+        hits = len(experiment.BehaviorTrial() & {**skey, 'outcome': 'hit'})
+        success_rates.append(100 * hits / len(trials) if len(trials) > 0 else np.nan)
+        reward_counts.append(len(experiment.TrialEvent() & {**skey, 'trial_event_type': 'reward'}))
         if len(trials) > 0:
-            session_length = (experiment.SessionTrial() & {'subject_id': subject_id, 'session': session,
-                                                             'trial': int(np.max(trials))}).fetch1('trial_end_time')
+            duration_s = float((experiment.SessionTrial() & {**skey, 'trial': int(np.max(trials))}).fetch1('trial_end_time'))
         else:
-            session_length = np.nan
-        session_lengths.append(session_length)
-    return available_sessions, np.array(trial_nums), np.array(session_lengths, dtype=float), np.array(hit_rates, dtype=float)
+            duration_s = np.nan
+        durations.append(duration_s / 60.0)
+        dates.append((experiment.Session() & skey).fetch1('session_date'))
+    return dict(session=available_sessions, date=np.array(dates), trial_num=np.array(trial_nums),
+                duration_min=np.array(durations, dtype=float), reward_count=np.array(reward_counts),
+                success_rate=np.array(success_rates, dtype=float))
 
 
-def plot_subject_behavior_trend(experiment, subject_id, fig_dir=None):
-    """Per-session trial count, session length, and hit rate for one subject, across all its sessions.
+def _add_trend_line(ax, sessions, values):
+    """Overlay a linear least-squares trend line across sessions (skipping NaNs). The slope,
+    shown in the legend, gives an objective read on whether performance is improving
+    (positive), flat, or getting worse (negative) session to session."""
+    valid = ~np.isnan(values)
+    if valid.sum() < 2:
+        return
+    slope, intercept = np.polyfit(sessions[valid], values[valid], 1)
+    ax.plot(sessions, slope * sessions + intercept, '--', color='gray', alpha=0.8,
+            label=f'trend ({slope:+.2f}/session)')
+    ax.legend(fontsize=7, loc='best')
+
+
+def _label_sessions_by_date(ax, sessions, dates):
+    """Replace an axis's bare session-number ticks with their calendar dates, so the spacing
+    between training days is legible at a glance."""
+    ax.set_xticks(sessions)
+    ax.set_xticklabels([d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in dates],
+                        rotation=45, ha='right', fontsize=8)
+    ax.set_xlabel('session date')
+
+
+def _add_session_hover_cursor(entries):
+    """Attach an mplcursors hover tooltip to session-trend line/bar plots.
+
+    entries: list of (artist, label, sessions, dates, values) tuples -- label is shown in
+    the tooltip (e.g. a subject_id) or None to omit it. Hovering a point shows its session
+    number, date, and value, since the plotted x axis only shows session number/date and the
+    raw value otherwise has to be read off a possibly-crowded y axis. Reading the value from
+    `values` (rather than the hovered artist's own position) keeps this working the same way
+    for both a line (one artist covering every session, nearest-point lookup by x) and a bar
+    (one artist per session, so its single entry is used directly).
+    """
+    import mplcursors
+
+    meta = {artist: (label, sessions, dates, values) for artist, label, sessions, dates, values in entries}
+
+    def _on_add(sel):
+        label, sessions, dates, values = meta[sel.artist]
+        if len(sessions) == 1:
+            idx = 0
+        else:
+            x, _ = sel.target
+            idx = int(np.argmin(np.abs(sessions - x)))
+        date = dates[idx]
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        prefix = f"{label}\n" if label else ""
+        sel.annotation.set_text(f"{prefix}session {sessions[idx]} ({date_str})\n{values[idx]:.3g}")
+
+    mplcursors.cursor(list(meta), hover=True).connect("add", _on_add)
+
+
+def _plot_trend_series(ax, sessions, values, dates, color, style='line', label=None):
+    """Plot one per-session series on ax as either connected points ('line') or bars ('bar').
+
+    Returns a list of hover entries ready for _add_session_hover_cursor: one per bar (each
+    already tied to its own exact session/date/value) for 'bar' style, or a single entry
+    covering the whole line (nearest-point lookup at hover time) for 'line' style.
+    """
+    if style == 'bar':
+        bars = ax.bar(sessions, values, width=0.8, color=color, alpha=0.85, label=label)
+        return [(bar, label, np.array([s]), np.array([d]), np.array([v]))
+                for bar, s, d, v in zip(bars, sessions, dates, values)]
+    line, = ax.plot(sessions, values, 'o-', color=color, label=label)
+    return [(line, label, sessions, dates, values)]
+
+
+def plot_subject_behavior_trend(experiment, subject_id, sessions=None, plot_style='line', fig_dir=None):
+    """Per-session trial count, session duration, reward count, and success rate for one
+    subject -- a learning-curve overview to judge, session to session, whether the animal is
+    improving (and so whether the task is ready to be made harder). Hover a point for its
+    exact session/date/value. The success-rate panel carries a linear trend line whose slope
+    (in the legend) is a single objective improving/flat/worsening number.
+
+    sessions restricts the plot to just those session ids (e.g. the ones currently selected
+    in the GUI); None (the default) shows every session the subject has.
+
+    plot_style is 'line' (connected points, default) or 'bar' (one bar per session) -- purely
+    cosmetic, same data and trend line either way.
 
     If fig_dir is given, saves to '{fig_dir}/{subject_id}_behavior_trend.png'.
     Returns the figure.
     """
-    available_sessions, trial_nums, session_lengths, hit_rates = _fetch_session_trend(experiment, subject_id)
+    import seaborn as sns
 
-    fig = plt.figure(figsize=(8, 8))
-    ax1 = fig.add_subplot(3, 1, 1)
-    ax1.plot(available_sessions, trial_nums, 'o-')
-    ax1.set_ylabel('number of trials')
-    ax1.set_title(f'{subject_id} behavior overview')
-    ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
-    ax2.plot(available_sessions, session_lengths, 'o-')
-    ax2.set_ylabel('session length (s)')
-    ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
-    ax3.plot(available_sessions, hit_rates, 'o-')
-    ax3.set_ylabel('hit rate')
-    ax3.set_xlabel('session')
-    fig.tight_layout()
+    trend = _fetch_session_trend(experiment, subject_id, sessions=sessions)
+    session_nums = trend['session']
+
+    with sns.axes_style('whitegrid'):
+        fig = plt.figure(figsize=(8, 10))
+        ax1 = fig.add_subplot(4, 1, 1)
+        ax2 = fig.add_subplot(4, 1, 2, sharex=ax1)
+        ax3 = fig.add_subplot(4, 1, 3, sharex=ax1)
+        ax4 = fig.add_subplot(4, 1, 4, sharex=ax1)
+
+        hover_entries = []
+        hover_entries += _plot_trend_series(ax1, session_nums, trend['trial_num'], trend['date'],
+                                             'tab:blue', style=plot_style)
+        ax1.set_ylabel('trials')
+        ax1.set_title(f'{subject_id} behavior overview')
+
+        hover_entries += _plot_trend_series(ax2, session_nums, trend['duration_min'], trend['date'],
+                                             'tab:orange', style=plot_style)
+        ax2.set_ylabel('duration (min)')
+
+        hover_entries += _plot_trend_series(ax3, session_nums, trend['reward_count'], trend['date'],
+                                             'tab:green', style=plot_style)
+        ax3.set_ylabel('rewards')
+
+        hover_entries += _plot_trend_series(ax4, session_nums, trend['success_rate'], trend['date'],
+                                             'tab:red', style=plot_style)
+        _add_trend_line(ax4, session_nums, trend['success_rate'])
+        ax4.set_ylabel('success rate (%)')
+        ax4.set_ylim(0, 100)
+
+        for ax in (ax1, ax2, ax3):
+            plt.setp(ax.get_xticklabels(), visible=False)
+        _label_sessions_by_date(ax4, session_nums, trend['date'])
+        _add_session_hover_cursor(hover_entries)
+        fig.tight_layout()
 
     if fig_dir is not None:
         os.makedirs(fig_dir, exist_ok=True)
@@ -937,36 +1367,59 @@ def plot_subject_behavior_trend(experiment, subject_id, fig_dir=None):
     return fig
 
 
-def plot_subject_behavior_trends(experiment, subject_ids, fig_dir=None):
-    """Per-session trial count, session length, and hit rate for multiple subjects, overlaid.
+def plot_subject_behavior_trends(experiment, subject_ids, plot_style='line', fig_dir=None):
+    """Per-session trial count, session duration, reward count, and success rate for multiple
+    subjects, overlaid -- lets several animals' learning curves be compared directly.
 
-    Each subject gets its own color and a legend entry. If subject_ids is empty, returns
-    an empty placeholder figure (nothing to fetch/plot).
+    Each subject gets its own color and a legend entry; hover a point for its exact
+    session/date/value. If subject_ids is empty, returns an empty placeholder figure
+    (nothing to fetch/plot).
+
+    plot_style is 'line' (connected points, default) or 'bar' (one bar per session) -- purely
+    cosmetic, same data either way. 'line' reads more clearly than 'bar' once more than a
+    couple of subjects' sessions overlap on the same x position.
+
     If fig_dir is given, saves to '{fig_dir}/subject_behavior_trends.png'.
     Returns the figure.
     """
-    fig = plt.figure(figsize=(8, 8))
-    ax1 = fig.add_subplot(3, 1, 1)
-    ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
-    ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
+    import seaborn as sns
 
-    if subject_ids:
-        colors = plt.cm.tab10(np.arange(len(subject_ids)) % 10)
-        for subject_id, color in zip(subject_ids, colors):
-            sessions, trial_nums, session_lengths, hit_rates = _fetch_session_trend(experiment, subject_id)
-            ax1.plot(sessions, trial_nums, 'o-', color=color, label=subject_id)
-            ax2.plot(sessions, session_lengths, 'o-', color=color)
-            ax3.plot(sessions, hit_rates, 'o-', color=color)
-        ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
-    else:
-        ax2.text(0.5, 0.5, 'Select one or more mice to show session trends',
-                  ha='center', va='center', transform=ax2.transAxes, color='gray')
+    with sns.axes_style('whitegrid'):
+        fig = plt.figure(figsize=(8, 10))
+        ax1 = fig.add_subplot(4, 1, 1)
+        ax2 = fig.add_subplot(4, 1, 2, sharex=ax1)
+        ax3 = fig.add_subplot(4, 1, 3, sharex=ax1)
+        ax4 = fig.add_subplot(4, 1, 4, sharex=ax1)
 
-    ax1.set_ylabel('number of trials')
-    ax2.set_ylabel('session length (s)')
-    ax3.set_ylabel('hit rate')
-    ax3.set_xlabel('session')
-    fig.tight_layout()
+        if subject_ids:
+            colors = sns.color_palette('tab10', n_colors=len(subject_ids))
+            hover_entries = []
+            for subject_id, color in zip(subject_ids, colors):
+                trend = _fetch_session_trend(experiment, subject_id)
+                session_nums = trend['session']
+                hover_entries += _plot_trend_series(ax1, session_nums, trend['trial_num'], trend['date'],
+                                                     color, style=plot_style, label=subject_id)
+                hover_entries += _plot_trend_series(ax2, session_nums, trend['duration_min'], trend['date'],
+                                                     color, style=plot_style, label=subject_id)
+                hover_entries += _plot_trend_series(ax3, session_nums, trend['reward_count'], trend['date'],
+                                                     color, style=plot_style, label=subject_id)
+                hover_entries += _plot_trend_series(ax4, session_nums, trend['success_rate'], trend['date'],
+                                                     color, style=plot_style, label=subject_id)
+            ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+            _add_session_hover_cursor(hover_entries)
+        else:
+            ax2.text(0.5, 0.5, 'Select one or more mice to show session trends',
+                      ha='center', va='center', transform=ax2.transAxes, color='gray')
+
+        ax1.set_ylabel('trials')
+        ax2.set_ylabel('duration (min)')
+        ax3.set_ylabel('rewards')
+        ax4.set_ylabel('success rate (%)')
+        ax4.set_ylim(0, 100)
+        for ax in (ax1, ax2, ax3):
+            plt.setp(ax.get_xticklabels(), visible=False)
+        ax4.set_xlabel('session')
+        fig.tight_layout()
 
     if fig_dir is not None:
         os.makedirs(fig_dir, exist_ok=True)

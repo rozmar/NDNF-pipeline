@@ -170,6 +170,23 @@ def _extract_block_trial_params(trial_statistics, data_version, tasklogic_dict, 
         'action_channel': action_channel,
     }
 
+def _block_feedback_type(default_feedback_type, trial_statistics):
+    """Feedback type actually used by one block: the task GUI's "Instantaneous" checkbox is
+    saved in the task logic as response_period.action.action_type - 'instantaneous'
+    (position feedback) or 'integrated' (speed feedback). The dimensionality (1D/2D/0D) still
+    comes from default_feedback_type; sessions without action_type keep the default."""
+    try:
+        action_type = trial_statistics['response_period']['action'].get('action_type')
+    except (KeyError, TypeError, AttributeError):
+        return default_feedback_type
+    dimensions = default_feedback_type.split('_')[0]
+    if action_type == 'instantaneous':
+        return dimensions + '_position'
+    if action_type == 'integrated':
+        return dimensions + '_speed'
+    return default_feedback_type
+
+
 def _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict, block_num, task_setting_id, feedback_type, first_trial_idx):
     if len(sessiontrial_dict_list) > first_trial_idx:
         block_dict_list.append({
@@ -629,6 +646,7 @@ def ingest_behavior_sessions(dj, dry_run=False, only=None):
                 current_block_local_idx = None
                 current_block_task_setting_id = None
                 current_block_has_cue = None
+                current_block_feedback_type = feedback_type
 
                 trial_i = 0
                 for trial_i, t_ in enumerate(data_dict['Trial']): # go through trials#hit
@@ -638,12 +656,13 @@ def ingest_behavior_sessions(dj, dry_run=False, only=None):
                         # a new block started: close out the previous one (if any), then set this one up
                         if current_block_local_idx is not None:
                             _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
-                                             current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
+                                             current_block, current_block_task_setting_id, current_block_feedback_type, block_first_trial_idx)
                             current_block = len(block_dict_list)
                             block_first_trial_idx = len(sessiontrial_dict_list)
                         current_block_local_idx = local_block_idx
 
                         block_trial_statistics = active_block_events[local_block_idx]['data']['trial_statistics']
+                        current_block_feedback_type = _block_feedback_type(feedback_type, block_trial_statistics)
                         block_params = _extract_block_trial_params(block_trial_statistics, data_version, tasklogic_dict, session_dict)
                         current_block_has_cue = block_params['has_cue']
                         valve_open_time = block_params['valve_open_time']
@@ -883,7 +902,7 @@ def ingest_behavior_sessions(dj, dry_run=False, only=None):
                     
                 trials_so_far += len(data_dict['Trial']) # for multiple files in a given session (also correct for 0- or 1-trial files)
                 _finalize_block(block_dict_list, sessiontrial_dict_list, subject_id, session_dict,
-                                 current_block, current_block_task_setting_id, feedback_type, block_first_trial_idx)
+                                 current_block, current_block_task_setting_id, current_block_feedback_type, block_first_trial_idx)
                 if sessiontrial_dict_list:
                     previous_file_last_end_time = sessiontrial_dict_list[-1]['trial_end_time']
             #% finally, do the insertion

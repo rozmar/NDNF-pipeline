@@ -301,6 +301,8 @@ class SessionOverviewTab:
         self.refresh()
 
     def refresh(self, *_, force=False):
+        if force:
+            dj_connection.query_cache.clear()  # Refresh button: always go back to the database
         if not force and not self.auto_refresh_cb.value:
             return
         subject_id = self.app.subject_select.value or None
@@ -437,6 +439,8 @@ class BlockDetailTab:
         return [int(t) for t in self.trial_select.value]
 
     def refresh(self, *_, force=False):
+        if force:
+            dj_connection.query_cache.clear()  # Refresh button: always go back to the database
         if not force and not self.auto_refresh_cb.value:
             return
         subject_id = self.app.subject_select.value or None
@@ -477,6 +481,8 @@ class SubjectTrendTab:
         self.refresh()
 
     def refresh(self, *_, force=False):
+        if force:
+            dj_connection.query_cache.clear()  # Refresh button: always go back to the database
         if not force and not self.auto_refresh_cb.value:
             return
         subject_id, _session = self.app.get_selected_subject_session()
@@ -509,7 +515,7 @@ class TrialsPerMouseTab:
         refresh_btn = pn.widgets.Button(name="Refresh", width=90)
         all_btn.on_click(lambda e: self.select_all())
         none_btn.on_click(lambda e: self.select_none())
-        reload_btn.on_click(lambda e: self.reload_mice())
+        reload_btn.on_click(lambda e: self.reload_mice(force=True))
         refresh_btn.on_click(lambda e: self.refresh(force=True))
         self.auto_refresh_cb = pn.widgets.Checkbox(name="Auto refresh", value=True)
 
@@ -531,9 +537,11 @@ class TrialsPerMouseTab:
         if not self._mice_loaded:
             self.reload_mice()
 
-    def reload_mice(self):
+    def reload_mice(self, force=False):
         if self.app.lab is None or self.app.experiment is None:
             return
+        if force:
+            dj_connection.query_cache.clear()  # Reload button: always go back to the database
         try:
             mouse_ids = sorted(self.app.lab.Subject.fetch("subject_id").tolist())
             trial_nums = [len(self.app.experiment.SessionTrial() & {"subject_id": m}) for m in mouse_ids]
@@ -562,6 +570,8 @@ class TrialsPerMouseTab:
         return list(self.mouse_select.value)
 
     def refresh(self, *_, force=False):
+        if force:
+            dj_connection.query_cache.clear()  # Refresh button: always go back to the database
         if not force and not self.auto_refresh_cb.value:
             return
         if self.app.lab is None or self.app.experiment is None:
@@ -596,6 +606,8 @@ class WaterRestrictionTab:
         self.refresh()
 
     def refresh(self, *_, force=False):
+        if force:
+            dj_connection.query_cache.clear()  # Refresh button: always go back to the database
         if not force and not self.auto_refresh_cb.value:
             return
         subject_id, _session = self.app.get_selected_subject_session()
@@ -1092,7 +1104,7 @@ class BehaviorGUI:
         self.session_select.param.watch(self._session_guard.wrap(lambda e: self.on_session_selected()), "value")
 
         reload_btn = pn.widgets.Button(name="Reload subjects", width=130)
-        reload_btn.on_click(lambda e: self.reload_subjects())
+        reload_btn.on_click(lambda e: self.reload_subjects(force=True))
         settings_btn = pn.widgets.Button(name="DataJoint config...", width=150)
         settings_btn.on_click(lambda e: self.settings_modal.show())
 
@@ -1216,9 +1228,11 @@ class BehaviorGUI:
         self.reload_subjects()
 
     # --- subject / session population ---
-    def reload_subjects(self):
+    def reload_subjects(self, force=False):
         if self.lab is None:
             return
+        if force:
+            dj_connection.query_cache.clear()  # Reload button: always go back to the database
         try:
             subject_ids = sorted(self.lab.Subject.fetch("subject_id").tolist())
         except Exception as exc:

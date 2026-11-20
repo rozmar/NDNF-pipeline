@@ -45,6 +45,26 @@ _LABELS = {
                lbl_target='Cél', lbl_current='Aktuális'),
 }
 
+# Folders holding local copies of raw video files, laid out like dj.config['path.raw_data'] (the
+# behavior GUI's "Download sessions" puts them in <download folder>/videos). Checked in order
+# before path.raw_data, so a downloaded video plays from local disk instead of the network share.
+LOCAL_VIDEO_ROOTS = []
+
+
+def resolve_video_path(file_path):
+    """Absolute path of a VideoFile.file_path: its local copy under LOCAL_VIDEO_ROOTS if there
+    is one, otherwise the file under dj.config['path.raw_data']."""
+    # file_path is recorded with Windows-style backslashes by the acquisition machine;
+    # os.path.join/os.path.exists don't treat '\' as a separator on Linux/Mac, so without
+    # this the whole thing silently glues into one nonexistent filename with literal
+    # backslashes in it (cv2.VideoCapture then just fails to open, with no clear error)
+    relative_path = file_path.replace('\\', '/')
+    for root in LOCAL_VIDEO_ROOTS:
+        local = os.path.join(root, *relative_path.split('/'))
+        if os.path.isfile(local):
+            return local
+    return _resolve_case_insensitive(dj.config['path.raw_data'], relative_path)
+
 
 def _resolve_case_insensitive(root, relative_path):
     """Resolve `relative_path` under `root`, tolerating per-segment case mismatches.
@@ -87,12 +107,7 @@ def _camera_video_file(videography, dj, key, camera_name, trials_needed):
         current_file_idx = tv_query.fetch1('video_file_idx')
         vf = (videography.VideoFile() & key & {'device': camera_name,
                                                 'video_file_idx': current_file_idx}).fetch1()
-        # file_path is recorded with Windows-style backslashes by the acquisition machine;
-        # os.path.join/os.path.exists don't treat '\' as a separator on Linux/Mac, so without
-        # this the whole thing silently glues into one nonexistent filename with literal
-        # backslashes in it (cv2.VideoCapture then just fails to open, with no clear error)
-        relative_path = vf['file_path'].replace('\\', '/')
-        video_file_path = _resolve_case_insensitive(dj.config['path.raw_data'], relative_path)
+        video_file_path = resolve_video_path(vf['file_path'])
         break
 
     if current_file_idx is None:
@@ -114,7 +129,15 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
                            camera_name_2=None, pad_start=1.0, pad_end=1.0,
                            filter_method=None, filter_window_ms=50.0, filter_sigma_ms=20.0,
                            filter_polyorder=3):
-    """Fetch and normalize everything needed to render a trial-range video for one block.
+    """Fetch and normalize everything needed to render a trial-range video.
+
+    block given (not None): the original, single-block behavior - trial_start/trial_end are
+    indices into that block's own sorted trial-number array (0 = first trial of the block).
+
+    block=None: trial_start/trial_end are actual (session-absolute) trial numbers instead, and
+    the range may span more than one block - e.g. the last trial of one block through the first
+    of the next. Each trial is drawn against its own block's target LUT, so the Target/Current
+    panels' LUT overlay switches when the video crosses into a new block's trial range.
 
     If camera_name_2 is given, a second camera's frames are resolved too (clipped to the same
     [t_video_start, t_video_end] window as the first, so both stay in sync) for a side-by-side
@@ -128,8 +151,9 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
     filtering, the default), 'boxcar' (moving average, `filter_window_ms`), 'median'
     (`filter_window_ms`), 'gaussian' (`filter_sigma_ms`), or 'savgol' (Savitzky-Golay
     polynomial fit, `filter_window_ms` and `filter_polyorder`). `filter_window_ms`/
-    `filter_sigma_ms` are converted to samples using the block's own force trace sample
-    interval, estimated from the first trial. This is the trace drawn in the video dashboard.
+    `filter_sigma_ms` are converted to samples using the sample interval estimated from the
+    first trial in range - the acquisition rate doesn't change trial-to-trial (or block-to-
+    block, in practice) so this is reused for every trial rather than re-estimated per trial.
 
     Returns a dict consumed by make_trial_video_frame_figure/preview_last_frame/render_trial_video.
     """
@@ -139,43 +163,56 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
 
     key = {'subject_id': subject_id, 'session': session}
 
-    # --- trials ---
-    block_trials  = np.sort((experiment.BehaviorTrial() & key & {'block': block}).fetch('trial'))
-    trials_needed = block_trials[trial_start: trial_end + 1]
+    # --- trials + which block each one belongs to ---
+    if block is not None:
+        block_trials = np.sort((experiment.BehaviorTrial() & key & {'block': block}).fetch('trial'))
+        trials_needed = block_trials[trial_start: trial_end + 1]
+        trial_block_by_num = {int(t): int(block) for t in trials_needed}
+    else:
+        all_trial_nums, all_trial_blocks = (experiment.BehaviorTrial() & key).fetch('trial', 'block', order_by='trial')
+        mask = (all_trial_nums >= trial_start) & (all_trial_nums <= trial_end)
+        trials_needed = all_trial_nums[mask]
+        trial_block_by_num = dict(zip(trials_needed.tolist(), (int(b) for b in all_trial_blocks[mask])))
+    if len(trials_needed) == 0:
+        raise RuntimeError(
+            f"No trials found for {subject_id} session {session}, trial_start={trial_start} trial_end={trial_end}.")
 
-    # --- force LUT and axis info from TaskSettings ---
-    task_setting_id      = (experiment.Block() & key & {'block': block}).fetch1('task_setting_id')
-    target_force_lut_raw = (experiment.TaskSettings() & key & {'task_setting_id': task_setting_id}).fetch1('target_force_lut')
-
-    # --- normalize to X=LR (L<0, R>0) and Y=PA (P<0, A>0) ---
+    # --- force LUT + axis info from TaskSettings, per block actually touched (usually just one) ---
     # shared with behavior_plots.plot_block_force_figure/plot_session_blocks_overview - was
     # previously reimplemented here with the sign-flip applied to the wrong array axis (flipped
     # dim1 where _normalize_lut flips dim0 for the same lr_idx==0 case, and vice versa), which
     # visibly mirrored the target LUT wrong on any rig where lr_sign/pa_sign is -1; reusing the
     # same function guarantees this stays pixel-consistent with those plots instead of drifting
-    force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(
-        experiment, subject_id, session, task_setting_id)
-    target_force_lut, lut_extent, lr_extent, pa_extent = _normalize_lut(
-        target_force_lut_raw, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+    lut_by_block = {}    # block -> (target_force_lut, lut_extent)
+    axes_by_block = {}   # block -> (lr_idx, pa_idx, lr_sign, pa_sign)
+    for b in sorted(set(trial_block_by_num.values())):
+        task_setting_id = (experiment.Block() & key & {'block': b}).fetch1('task_setting_id')
+        target_force_lut_raw = (experiment.TaskSettings() & key & {'task_setting_id': task_setting_id}).fetch1('target_force_lut')
+        force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign = _get_block_force_axes(
+            experiment, subject_id, session, task_setting_id)
+        target_force_lut, lut_extent, lr_extent, pa_extent = _normalize_lut(
+            target_force_lut_raw, force_axes_dict, lr_idx, pa_idx, lr_sign, pa_sign)
+        lut_by_block[b] = (target_force_lut, lut_extent)
+        axes_by_block[b] = (lr_idx, pa_idx, lr_sign, pa_sign)
 
     # --- per-trial data (force, feedback, rewards, threshold crossings) ---
-    all_force_t, all_force_0, all_force_1 = [], [], []
+    all_force_t, all_force_lr, all_force_pa = [], [], []
     all_reward_t, all_threshold_t, all_lick_t = [], [], []
     all_lickport_t, all_lickport_pos = [], []
     trial_start_times = {}
-    trial_periods = []  # per-trial (t_start, t_end, quiescence_end, response_end), all absolute
+    trial_periods = []  # per-trial (t_start, t_end, quiescence_end, response_end, block), all absolute
 
-    # sample interval is estimated once, from the first trial, and reused for every trial in
-    # this block (matching estimate_force_sample_interval / plot_block_force_figure) - the
-    # acquisition rate doesn't change trial-to-trial, so this avoids re-estimating per trial
     sample_interval_s = None
     lickport_carry = None  # last known lickport position, carried across the trial-to-trial gap
     for trial in trials_needed:
+        trial = int(trial)
+        trial_block = trial_block_by_num[trial]
+        lr_idx, pa_idx, lr_sign, pa_sign = axes_by_block[trial_block]
         t_start, t_end = (experiment.SessionTrial() & key & {'trial': trial}).fetch1('trial_start_time', 'trial_end_time')
         t_start, t_end = float(t_start), float(t_end)
         trial_start_times[trial] = t_start
 
-        ft = (experiment.TrialForceTrace()                & key & {'trial': trial}).fetch1('force_trace_time')
+        ft = np.asarray((experiment.TrialForceTrace()                & key & {'trial': trial}).fetch1('force_trace_time'), float)
         f0 = (experiment.TrialForceTrace.TrialForceAxis() & key & {'trial': trial, 'force_axis_idx': 0}).fetch1('force_trace_value')
         f1 = (experiment.TrialForceTrace.TrialForceAxis() & key & {'trial': trial, 'force_axis_idx': 1}).fetch1('force_trace_value')
         if filter_method and filter_method != 'none':
@@ -185,7 +222,12 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
             filter_sigma = ms_to_samples_float(filter_sigma_ms, sample_interval_s, minimum=1e-6)
             f0 = _filter_trace(f0, filter_method, window=filter_window, sigma=filter_sigma, polyorder=filter_polyorder)
             f1 = _filter_trace(f1, filter_method, window=filter_window, sigma=filter_sigma, polyorder=filter_polyorder)
-        all_force_t.extend(ft + t_start);  all_force_0.extend(f0);  all_force_1.extend(f1)
+        f0, f1 = np.asarray(f0, float), np.asarray(f1, float)
+        # this trial's own block's LR/PA sign/order convention (may differ trial-to-trial when
+        # the range spans a block boundary), same formula as behavior_plots._lr_pa_traces
+        lr = lr_sign * (f0 if lr_idx == 0 else f1)
+        pa = pa_sign * (f1 if pa_idx == 1 else f0)
+        all_force_t.extend(ft + t_start);  all_force_lr.extend(lr);  all_force_pa.extend(pa)
 
         rewards    = np.asarray((experiment.TrialEvent() & key & {'trial': trial, 'trial_event_type': 'reward'}).fetch('trial_event_time'), float)
         thresholds = np.asarray((experiment.TrialEvent() & key & {'trial': trial, 'trial_event_type': 'threshold crossing'}).fetch('trial_event_time'), float)
@@ -203,7 +245,8 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
         else:
             response_end = None
         trial_periods.append(dict(t_start=t_start, t_end=t_end,
-                                   quiescence_end=quiescence_end, response_end=response_end))
+                                   quiescence_end=quiescence_end, response_end=response_end,
+                                   block=trial_block))
 
         # the port stays closed (wherever the last reward left it) through the whole quiescence
         # period -- nothing touches it, and it isn't logged again until the 'go' event opens it
@@ -228,17 +271,13 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
         all_lickport_pos.extend(ext_pos)
 
     all_force_t       = np.array(all_force_t)
-    all_force_0       = np.array(all_force_0)
-    all_force_1       = np.array(all_force_1)
+    all_force_lr      = np.array(all_force_lr)
+    all_force_pa      = np.array(all_force_pa)
     all_reward_t      = np.array(all_reward_t)
     all_threshold_t   = np.array(all_threshold_t)
     all_lick_t        = np.array(all_lick_t)
     all_lickport_t    = np.array(all_lickport_t)
     all_lickport_pos  = np.array(all_lickport_pos)
-
-    # --- force traces in the normalized LR/PA convention ---
-    all_force_lr = lr_sign * (all_force_0 if lr_idx == 0 else all_force_1)
-    all_force_pa = pa_sign * (all_force_1 if pa_idx == 1 else all_force_0)
 
     lp_shifted        = all_lickport_pos - np.min(all_lickport_pos)
     all_lickport_norm = lp_shifted / np.max(np.abs(lp_shifted))
@@ -246,8 +285,8 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
     # --- video: use full VideoFileFrameTimes to support padding ---
     video_file_path, file_frame_times = _camera_video_file(videography, dj, key, camera_name, trials_needed)
 
-    raw_t_end     = float((experiment.SessionTrial() & key & {'trial': int(trials_needed[-1])}).fetch1('trial_end_time'))
-    t_video_start = max(float(trial_start_times[trials_needed[0]]) - pad_start, float(file_frame_times[0]))
+    raw_t_end     = trial_periods[-1]['t_end']  # the last trial's, already fetched in the loop above
+    t_video_start = max(float(trial_start_times[int(trials_needed[0])]) - pad_start, float(file_frame_times[0]))
     t_video_end   = min(raw_t_end + pad_end, float(file_frame_times[-1]))
 
     frame_abs_indices, frame_session_times = _camera_frame_window(file_frame_times, t_video_start, t_video_end)
@@ -265,7 +304,7 @@ def load_trial_video_data(subject_id, session, block, trial_start, trial_end, ca
         filter_method=filter_method, filter_window_ms=filter_window_ms,
         filter_sigma_ms=filter_sigma_ms, filter_polyorder=filter_polyorder,
         trials_needed=trials_needed,
-        target_force_lut=target_force_lut, lut_extent=lut_extent,
+        target_force_luts=lut_by_block,
         all_force_t=all_force_t, all_force_lr=all_force_lr, all_force_pa=all_force_pa,
         all_reward_t=all_reward_t, all_threshold_t=all_threshold_t, all_lick_t=all_lick_t,
         all_lickport_t=all_lickport_t, all_lickport_norm=all_lickport_norm,
@@ -397,8 +436,9 @@ class _VideoFrameArtists:
         self.im1 = ax_img.imshow(_prepare_frame(video_frame, crop, clims, self.img_target_size))
         ax_img.axis('off')
         if is_preview:
+            block_label = data['block'] if data['block'] is not None else 'all'
             ax_img.set_title(f"{data['camera_name']}  subject={data['subject_id']}  session={data['session']}  "
-                              f"block={data['block']}  trials {data['trial_start']}–{data['trial_end']}  [LAST FRAME]",
+                              f"block={block_label}  trials {data['trial_start']}–{data['trial_end']}  [LAST FRAME]",
                               fontsize=11)
         else:
             ax_img.set_title(data['camera_name'], fontsize=9)
@@ -408,28 +448,40 @@ class _VideoFrameArtists:
             ax_img_2.axis('off')
             ax_img_2.set_title(data['camera_name_2'], fontsize=9)
 
-        # --- fully static: target LUT never changes within a block, so it's drawn once and
-        # never touched again by update() - this is the panel that was previously getting
-        # rebuilt from scratch on every single frame for no reason ---
-        target_force_lut = data['target_force_lut']
-        lut_extent = data['lut_extent']
+        # --- target LUT: the same for the whole video in the (usual) single-block case, so it's
+        # drawn once here and never touched again by update() - this is the panel that was
+        # previously getting rebuilt from scratch on every single frame for no reason. If the
+        # trial range spans a block boundary, target_force_luts has one entry per block touched;
+        # update() then swaps im_target/im_current_lut's data (via .set_data(), not a redraw)
+        # whenever the trial actually showing crosses into a new block - which is rare (once per
+        # boundary) so this stays just as cheap in the common single-block case ---
+        target_force_luts = data['target_force_luts']  # {block: (target_force_lut, lut_extent)}
         uniform_extent = [-force_axis_limit, force_axis_limit, -force_axis_limit, force_axis_limit]
-        vmin, vmax = np.min(target_force_lut), np.max(target_force_lut)
-        lut_disp, lut_disp_extent = _pad_lut_to_range(target_force_lut, lut_extent, uniform_extent)
-        ax_target.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
-                          cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax)
+        lut_vmin = min(np.min(lut) for lut, _ in target_force_luts.values())
+        lut_vmax = max(np.max(lut) for lut, _ in target_force_luts.values())
+        # {block: (lut_disp, lut_disp_extent)} - _pad_lut_to_range returns the padded LUT and the
+        # extent it actually covers (it may be cropped/padded relative to uniform_extent)
+        self._lut_disp_by_block = {
+            b: _pad_lut_to_range(lut, extent, uniform_extent) for b, (lut, extent) in target_force_luts.items()
+        }
+        self._trial_periods = data['trial_periods']  # ordered by trial; each carries its own 'block'
+        self.current_lut_block = self._block_at_time(t_now)
+        lut_disp, lut_disp_extent = self._lut_disp_by_block[self.current_lut_block]
+        self.im_target = ax_target.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
+                                           cmap='viridis', aspect='auto', vmin=lut_vmin, vmax=lut_vmax)
         ax_target.set_xlim([-force_axis_limit, force_axis_limit])
         ax_target.set_ylim([-force_axis_limit, force_axis_limit])
         ax_target.set_xlabel(self.labels['force_x'], fontsize=10)
         ax_target.set_ylabel(self.labels['force_y'], fontsize=10)
         ax_target.set_title(self.labels['lbl_target'], fontsize=11)
 
-        # --- fully static: same target LUT overlaid faintly on the Current panel, so the
-        # trajectory can be read against the target without glancing over to the separate Target
-        # panel; drawn before the trajectory artists below so it stays behind them, and kept
-        # translucent (lut_alpha) so it doesn't drown out the black/gray trajectory on top of it ---
-        self.ax_current.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
-                                cmap='viridis', aspect='auto', vmin=vmin, vmax=vmax, alpha=lut_alpha)
+        # --- same target LUT overlaid faintly on the Current panel, so the trajectory can be
+        # read against the target without glancing over to the separate Target panel; drawn
+        # before the trajectory artists below so it stays behind them, and kept translucent
+        # (lut_alpha) so it doesn't drown out the black/gray trajectory on top of it ---
+        self.im_current_lut = self.ax_current.imshow(lut_disp, extent=lut_disp_extent, origin='lower',
+                                                       cmap='viridis', aspect='auto',
+                                                       vmin=lut_vmin, vmax=lut_vmax, alpha=lut_alpha)
 
         # --- dynamic: force trajectory (placeholder artists now, real data via update() below) ---
         self.line_all,  = self.ax_current.plot([], [], '-', color='black', linewidth=0.7,alpha = .5)
@@ -486,6 +538,25 @@ class _VideoFrameArtists:
 
         self.update(video_frame, t_now, video_frame_2=video_frame_2)
 
+    def _block_at_time(self, t):
+        """Which block's target LUT should be showing at absolute session time t: the block of
+        the latest trial whose period has started by t (falling back to the first trial's block
+        for anything before the first trial, which only matters for the padded lead-in).
+
+        Computed fresh from `t` and the read-only trial_periods every call, so it stays correct
+        no matter which frame a render worker starts on - the self.current_lut_block comparison
+        in update() below is only a cache to skip a redundant .set_data() call, never something
+        a frame's correctness depends on (frames must stay independent - see render_trial_video/
+        _render_frame_chunk)."""
+        periods = self._trial_periods
+        block = periods[0]['block']
+        for period in periods:
+            if period['t_start'] <= t:
+                block = period['block']
+            else:
+                break
+        return block
+
     def _shade_periods(self, ax, t_end):
         """Quiescence/response shading for one axis, clipped to what's visible so far (t_end) -
         matching behavior_plots' _shade_trial_periods. Appends the new patches to self.spans so
@@ -514,6 +585,16 @@ class _VideoFrameArtists:
         self.im1.set_data(_prepare_frame(video_frame, self.crop, self.clims, self.img_target_size))
         if self.im2 is not None and video_frame_2 is not None:
             self.im2.set_data(_prepare_frame(video_frame_2, self.crop_2, self.clims_2, self.img_target_size_2))
+
+        # target LUT only actually changes when the trial range spans a block boundary and t_now
+        # has just crossed into it - see _block_at_time and the comment where these are built
+        block_now = self._block_at_time(t_now)
+        if block_now != self.current_lut_block:
+            new_disp, new_extent = self._lut_disp_by_block[block_now]
+            for im in (self.im_target, self.im_current_lut):
+                im.set_data(new_disp)
+                im.set_extent(new_extent)
+            self.current_lut_block = block_now
 
         all_force_t  = data['all_force_t']
         all_force_lr = data['all_force_lr']
