@@ -90,7 +90,7 @@ class PerfAxisControls(ttk.Frame):
             window = self._default_window
             self.smoothing_window.set(str(window))
         return window
-
+#oioioioi
 
 class EpochSelector(ttk.Frame):
     """Checkboxes restricting the force histogram/trajectory (and force-vs-time) panels to
